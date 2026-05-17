@@ -1,0 +1,17 @@
+{
+  "name": "aion",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "lint": "prettier --check .",
+    "format": "prettier --write .",
+    "start": "vite preview"
+  },
+  "devDependencies": {
+    "prettier": "^3.3.3",
+    "vite": "^5.4.10"
+  }
+}
