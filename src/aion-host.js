@@ -5,11 +5,13 @@ export default class AionHost {
   #pendingCode = null
   #onError = null
   #onCompiled = null
+  #onTime = null
 
-  constructor({ stdlib = "", onError = null, onCompiled = null } = {}) {
+  constructor({ stdlib = "", onError = null, onCompiled = null, onTime = null } = {}) {
     this.#stdlib = stdlib
     this.#onError = onError
     this.#onCompiled = onCompiled
+    this.#onTime = onTime
   }
 
   get state() {
@@ -36,6 +38,7 @@ export default class AionHost {
 
   async stop() {
     if (this.#ctx?.state === "running") await this.#ctx.suspend()
+    this.#onTime?.(0)
   }
 
   async apply(code) {
@@ -54,5 +57,6 @@ export default class AionHost {
   #onWorkletMessage(msg) {
     if (msg.type === "error") this.#onError?.(msg.message)
     else if (msg.type === "compiled") this.#onCompiled?.()
+    else if (msg.type === "time") this.#onTime?.(msg.value)
   }
 }

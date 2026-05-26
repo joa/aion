@@ -66,10 +66,21 @@ textarea {
 
 .controls {
   display: flex;
+  align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
 }
 
-button {
+.example-picker {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+button,
+select {
   padding: 8px 14px;
   background: #222;
   color: var(--fg);
@@ -77,8 +88,13 @@ button {
   border-radius: 6px;
   font: inherit;
   font-size: 13px;
+}
+
+button {
   cursor: pointer;
 }
-button:hover {
+
+button:hover,
+select:hover {
   border-color: var(--accent);
 }

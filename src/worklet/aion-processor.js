@@ -2,6 +2,7 @@ class AionProcessor extends AudioWorkletProcessor {
   #fn = () => [0, 0]
   #frame = 0
   #self
+  #err = false
 
   constructor() {
     super()
@@ -10,6 +11,7 @@ class AionProcessor extends AudioWorkletProcessor {
   }
 
   #onMessage({ type, code }) {
+    this.#err = false
     if (type === "reset") {
       this.#frame = 0
       return
@@ -27,6 +29,7 @@ class AionProcessor extends AudioWorkletProcessor {
       this.port.postMessage({ type: "compiled" })
     } catch (err) {
       this.port.postMessage({ type: "error", message: String(err) })
+      this.#err = true
     }
   }
 
@@ -35,9 +38,22 @@ class AionProcessor extends AudioWorkletProcessor {
     const left = out[0]
     const right = out[1] ?? out[0]
     const sr = sampleRate
+    let once = false
     for (let i = 0; i < left.length; i++) {
-      ;[left[i], right[i]] = this.#fn(this.#frame++ / sr)
+      try {
+        const [l, r] = this.#fn(this.#frame++ / sr)
+        if (isNaN(l) || isNaN(r)) {
+          throw "NaN"
+        }
+        left[i] = l
+        right[i] = r
+      } catch (err) {
+          left[i] = right[i] = 0.0
+          this.#err || this.port.postMessage({ type: "error", message: String(err) })
+          this.#err = true
+      }
     }
+    this.#err || this.port.postMessage({ type: "time", value: this.#frame / sr })
     return true
   }
 }

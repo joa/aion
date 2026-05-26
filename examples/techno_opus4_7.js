@@ -1,4 +1,5 @@
-```js
+// composed by opus 4.7 -- with a bit of human kick drum tweaking
+
 const BPM = 132
 const tempo = A.tempoBpm(BPM)
 const barSec = A.sec("1", tempo)
@@ -19,13 +20,10 @@ const sidechain = (f, depth = 1) => {
   }
 }
 
-const kick = A.seq(A.pattern(
-  "#---",
-  A.kick({ tuneHz: 24, decaySec: 0.52, pitchDecaySec: 0.04 })), "1/16", tempo)
+const kick = A.polyseq(A.pattern("#---", A.kick({ tuneHz: 8, decaySec: quarterSec, pitchDecaySec: eighthSec  })), "1/16", tempo, 1)
 
-const ghostKick = A.seq(A.pattern(
-  "-------#------#-",
-  A.vol(A.kick({ tuneHz: 22, decaySec: 0.12, pitchDecaySec: 0.1 }), 0.16)),
+const ghostKick = A.seq(
+  A.pattern("-------#------#-", A.vol(A.kick({ tuneHz: 22, decaySec: 0.12, pitchDecaySec: 0.1 }), 0.16)),
   "1/16",
   tempo
 )
@@ -37,7 +35,7 @@ const hats = A.seq(
     null,
     A.vol(ch, 0.06),
     A.vol(oh, 0.27),
-    A.vol(ch),
+    A.vol(ch, 0.07),
     null,
     A.vol(ch, 0.05),
     A.vol(oh, 0.24),
@@ -194,7 +192,10 @@ let pads = A.polyseq(
   tempo,
   8
 )
-pads = sidechain(A.vol(A.ichorus(A.iphaser(A.ilpf(pads, 1250, 0.9, 180), 0.045, 0.55, 5, 160), 0.07, 0.012, 4, 0.028, 0.55), 0.33), 0.8)
+pads = sidechain(
+  A.vol(A.ichorus(A.iphaser(A.ilpf(pads, 1250, 0.9, 180), 0.045, 0.55, 5, 160), 0.07, 0.012, 4, 0.028, 0.55), 0.33),
+  0.8
+)
 
 const stab = A.seq(
   [
@@ -227,13 +228,32 @@ const drums = A.sum(A.vol(kick, 0.98), ghostKick, hats, clap, perc)
 const fullDrums = A.sum(drums, ride)
 const lowEnd = A.sum(A.vol(kick, 0.98), rumble)
 
-const intro = A.sum(A.vol(kick, A.fadeIn(bar(4))), A.vol(rumble, A.fadeIn(bar(8))), A.vol(hats, A.fadeIn(bar(8), bar(4))))
+const intro = A.sum(
+  A.vol(kick, A.fadeIn(bar(4))),
+  A.vol(rumble, A.fadeIn(bar(8))),
+  A.vol(hats, A.fadeIn(bar(8), bar(4)))
+)
 const groove = A.sum(lowEnd, hats, clap, A.vol(perc, 0.45), A.vol(pads, A.fadeIn(bar(8))))
 const acidIn = A.sum(lowEnd, drums, pads, delayedStab, A.vol(acid, A.fadeIn(bar(12))), A.vol(sweep, 0.35))
 const drop = A.sum(lowEnd, fullDrums, pads, delayedStab, acid, acidHook)
-const breakDown = A.sum(A.vol(kick, 0.32), A.vol(rumble, 0.55), A.vol(pads, 1.4), A.vol(delayedStab, 0.75), A.vol(acidHook, 0.32))
-const tension = A.sum(A.vol(kick, A.fadeOut(bar(4), 0)), A.vol(hats, A.fadeIn(bar(4))), A.vol(acid, A.fadeIn(bar(4))), A.vol(sweep, 0.75))
-const outro = A.sum(A.vol(lowEnd, A.fadeOut(bar(6), bar(2))), A.vol(hats, A.fadeOut(bar(8), 0)), A.vol(pads, A.fadeOut(bar(8), 0)))
+const breakDown = A.sum(
+  A.vol(kick, 0.32),
+  A.vol(rumble, 0.55),
+  A.vol(pads, 1.4),
+  A.vol(delayedStab, 0.75),
+  A.vol(acidHook, 0.32)
+)
+const tension = A.sum(
+  A.vol(kick, A.fadeOut(bar(4), 0)),
+  A.vol(hats, A.fadeIn(bar(4))),
+  A.vol(acid, A.fadeIn(bar(4))),
+  A.vol(sweep, 0.75)
+)
+const outro = A.sum(
+  A.vol(lowEnd, A.fadeOut(bar(6), bar(2))),
+  A.vol(hats, A.fadeOut(bar(8), 0)),
+  A.vol(pads, A.fadeOut(bar(8), 0))
+)
 
 const arrangement = A.song(
   A.section(intro, bar(16)),
@@ -247,4 +267,3 @@ const arrangement = A.song(
 )
 
 A.icomp(arrangement, { thresholdDb: -8.5, ratio: 3.5, kneeDb: 4, attackSec: 0.004, releaseSec: 0.14, makeupDb: 1.2 })
-```

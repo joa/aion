@@ -1,0 +1,376 @@
+const BPM = 122
+const tempo = A.tempoBpm(BPM)
+const barSec = A.sec("1", tempo)
+const quarterSec = A.sec("1/4", tempo)
+const sixteenthSec = A.sec("1/16", tempo)
+const bar = (n) => barSec * n
+
+// ### Mixing
+// Manually controlled pump
+const pump = (t) => 0.28 + 0.72 * Math.min(1, (t % quarterSec) / (sixteenthSec * 1.35))
+const sidechain = (f, depth = 1) => {
+  const out = A.alloc()
+  return (t) => {
+    const [l, r] = f(t)
+    const g = A.lerp(1, pump(t), depth)
+    out[0] = l * g
+    out[1] = r * g
+    return out
+  }
+}
+
+// ### Drums
+const kick = A.seq(A.pattern("#---", A.kick({ tuneHz: 33, decaySec: 0.42, pitchDecaySec: 0.055 })), "1/16", tempo)
+
+const ghost = A.vol(A.kick({ tuneHz: 46, decaySec: 0.18, pitchDecaySec: 0.07 }), 0.18)
+const ghostKick = A.seq(A.pattern("-------#------#-", ghost), "1/16", tempo)
+
+const ch = A.hihat({ decaySec: 0.022, shimmerHz: 8800, tone: 0.06 })
+const oh = A.hihat({ open: true, decaySec: 0.16, shimmerHz: 7400, tone: 0.1 })
+const hats = A.seq(
+  [
+    null,
+    A.vol(ch, 0.07),
+    A.vol(oh, 0.22),
+    A.vol(ch, 0.1),
+    null,
+    A.vol(ch, 0.06),
+    A.vol(oh, 0.24),
+    A.vol(ch, 0.09),
+    null,
+    A.vol(ch, 0.07),
+    A.vol(oh, 0.22),
+    A.vol(ch, 0.1),
+    null,
+    A.vol(ch, 0.06),
+    A.vol(oh, 0.26),
+    A.vol(ch, 0.12),
+  ],
+  "1/16",
+  tempo
+)
+
+const snareV = (vel) => A.vol(A.snare({ tuneHz: 215, noiseAmt: 0.78, decaySec: 0.13, snap: 0.42 }), vel)
+const clap = A.seq(
+  [null, null, null, null, snareV(0.36), null, null, null, null, null, null, null, snareV(0.38), null, null, null],
+  "1/16",
+  tempo
+)
+
+const ping = (note, p, vel) =>
+  A.pan(A.vol(A.fm2(A.pitch(note), { ratio: 1.7, modIndex: 5, modDecaySec: 0.04 }), vel), p)
+const perc = A.seq(
+  [
+    null,
+    null,
+    null,
+    ping("C#5", -0.4, 0.1),
+    null,
+    null,
+    ping("F#5", 0.44, 0.09),
+    null,
+    null,
+    ping("A4", -0.32, 0.11),
+    null,
+    null,
+    null,
+    ping("D#5", 0.36, 0.1),
+    null,
+    ping("G#5", -0.5, 0.07),
+  ],
+  "1/16",
+  tempo
+)
+
+// ### Bass
+// F#m-D-A-E-
+const subBass = (note) => {
+  const hz = A.pitch(note)
+  const env = A.adsr({
+    releaseTime: barSec * 0.95,
+    attackSec: 0.01,
+    decaySec: 0.28,
+    sustain: 0.82,
+    releaseSec: 0.2,
+  })
+  const out = A.alloc()
+  return (t) => {
+    const e = env(t)
+    const s = (A.sin(t, hz) * 0.72 + A.saw(t, hz) * 0.18 + A.saw(t, hz * 2) * 0.06) * e * 0.55
+    out[0] = s
+    out[1] = s
+    return out
+  }
+}
+
+// maxVoices=2 lets the release of one note crossfade under the attack of the next.
+const bassRaw = A.polyseq(
+  [subBass("F#1"), null, subBass("D1"), null, subBass("A1"), null, subBass("E1"), null],
+  "1/2",
+  tempo,
+  2
+)
+const bass = sidechain(A.vol(bassRaw, 0.85), 0.92)
+
+// ### Pads
+const padChord = (notes) => A.chord((hz) => A.sum(A.pad(hz, A.suprsaw), A.vol(A.pad(hz / 2, A.tri), 0.45)), ...notes)
+
+const padsRaw = A.polyseq(
+  [
+    padChord(["F#3", "A3", "C#4", "F#4"]),
+    null,
+    null,
+    null,
+    padChord(["D3", "F#3", "A3", "D4"]),
+    null,
+    null,
+    null,
+    padChord(["A3", "C#4", "E4", "A4"]),
+    null,
+    null,
+    null,
+    padChord(["E3", "G#3", "B3", "E4"]),
+    null,
+    null,
+    null,
+  ],
+  "1/4",
+  tempo,
+  8
+)
+const padsProc = A.ichorus(A.iphaser(A.ilpf(padsRaw, 1500, 0.85, 220), 0.045, 0.55, 4, 180), 0.08, 0.012, 4, 0.026, 0.5)
+const pads = sidechain(A.vol(padsProc, 0.36), 0.7)
+
+// ### Arpeggio
+// Running 16ths over the 4-bar chord cycle.
+const arpVoice = (note) =>
+  A.fm2(A.pitch(note), {
+    ratio: 1,
+    modIndex: 1.7,
+    modDecaySec: 0.05,
+    env: A.adsr({ releaseTime: 0.06, attackSec: 0.002, decaySec: 0.11, sustain: 0, releaseSec: 0.05 }),
+  })
+
+const arpNotes = [
+  // F#m
+  "F#3",
+  "C#4",
+  "A3",
+  "F#4",
+  "C#4",
+  "A3",
+  "F#3",
+  "C#4",
+  "A3",
+  "F#4",
+  "C#4",
+  "A3",
+  "F#3",
+  "C#4",
+  "A3",
+  "F#3",
+  // D
+  "D3",
+  "A3",
+  "F#3",
+  "D4",
+  "A3",
+  "F#3",
+  "D3",
+  "A3",
+  "F#3",
+  "D4",
+  "A3",
+  "F#3",
+  "D3",
+  "A3",
+  "F#3",
+  "D3",
+  // A
+  "A3",
+  "E4",
+  "C#4",
+  "A4",
+  "E4",
+  "C#4",
+  "A3",
+  "E4",
+  "C#4",
+  "A4",
+  "E4",
+  "C#4",
+  "A3",
+  "E4",
+  "C#4",
+  "A3",
+  // E
+  "E3",
+  "B3",
+  "G#3",
+  "E4",
+  "B3",
+  "G#3",
+  "E3",
+  "B3",
+  "G#3",
+  "E4",
+  "B3",
+  "G#3",
+  "E3",
+  "B3",
+  "G#3",
+  "E3",
+]
+const arpRaw = A.seq(arpNotes.map(arpVoice), "1/16", tempo)
+const arpFilt = A.ilpf(arpRaw, 1900, 1.5, 240)
+const arpWide = A.ichorus(arpFilt, 0.22, 0.006, 3, 0.02, 0.45)
+const arpDel = A.idelay(arpWide, 5, A.sec("3/16", tempo), 0.46)
+const arp = sidechain(A.vol(A.mix(arpWide, arpDel, 0.6), 0.42), 0.55)
+
+// Filtered-down version for the breakdown.
+const arpDark = sidechain(A.vol(A.ilpf(arpRaw, 580, 1, 280), 0.34), 0.4)
+
+// Sparser top-octave arp that joins on drop 2. Auto-panned + delayed.
+const arpTopVoice = (note) =>
+  A.fm2(A.pitch(note), {
+    ratio: 2,
+    modIndex: 1,
+    modDecaySec: 0.035,
+    env: A.adsr({ releaseTime: 0.05, attackSec: 0.002, decaySec: 0.08, sustain: 0, releaseSec: 0.04 }),
+  })
+const arpTopNotes = [
+  "F#5",
+  null,
+  "C#5",
+  null,
+  "A4",
+  null,
+  "F#5",
+  null,
+  "D5",
+  null,
+  "A4",
+  null,
+  "F#4",
+  null,
+  "D5",
+  null,
+  "C#5",
+  null,
+  "A4",
+  null,
+  "E5",
+  null,
+  "C#5",
+  null,
+  "B4",
+  null,
+  "G#4",
+  null,
+  "E4",
+  null,
+  "G#4",
+  null,
+]
+const arpTopRaw = A.seq(
+  arpTopNotes.map((n) => (n ? arpTopVoice(n) : null)),
+  "1/8",
+  tempo
+)
+const arpTopPan = A.pan(arpTopRaw, (t) => A.sin(t, 0.13) * 0.42)
+const arpTopDel = A.idelay(arpTopPan, 4, A.sec("3/16", tempo), 0.4)
+const arpTop = sidechain(A.vol(A.mix(arpTopPan, arpTopDel, 0.55), 0.18), 0.5)
+
+// ### Reverse-Time Effects
+// A long decaying crash, mirrored over the build window. Decay-to-silence becomes
+// silence-to-attack: a clean riser that peaks at the drop boundary.
+const riser8 = A.vol(
+  A.timeReverse(
+    A.seq([A.hihat({ open: false, decaySec: 0.05, shimmerHz: 400, tone: 0.06 }), null], "1/8", tempo),
+    //A.hihat({ open: true, decaySec: 9, shimmerHz: 4400, tone: 0.06 }),
+    0,
+    bar(8)
+  ),
+  0.6
+)
+// Shorter version for the breakdown's reverse swell accent.
+const reverseSwellShort = A.vol(
+  A.timeReverse(
+    A.seq([A.hihat({ open: false, decaySec: 0.025, shimmerHz: 200, tone: 0.17 }), null], "1/8", tempo),
+    //A.hihat({ open: true, decaySec: 4.5, shimmerHz: 5000, tone: 0.07 }),
+    0,
+    bar(4)
+  ),
+  0.6
+)
+
+// Reverse pad swell for the intro: a tonal chord that naturally decays, mirrored
+// across the whole intro. The result rises from near-silence at t=0 to a peak
+// right at the intro -> build1 boundary.
+const introTone = (hz) => {
+  const out = A.alloc()
+  return (t) => {
+    const env = Math.exp(-t / 4.5)
+    const s = (A.sin(t, hz) + 0.42 * A.sin(t, hz * 2) + 0.18 * A.sin(t, hz * 3)) * env * 0.05
+    out[0] = s
+    out[1] = s
+    return out
+  }
+}
+const introToneChord = A.chord(introTone, "F#2", "C#3", "F#3", "A3", "C#4")
+const introSwell = A.timeReverse(introToneChord, 0, bar(16))
+
+// Snare roll
+const snareRoll = A.seq([null, null, snareV(0.12), null], "1/16", tempo)
+const snareRollDense = A.seq([snareV(0.16), null, snareV(0.12), snareV(0.1)], "1/16", tempo)
+const snareBuild = A.sum(snareRoll, A.vol(snareRollDense, A.fadeIn(bar(4), bar(4))))
+
+// ### Arrangement
+const coreDrums = A.sum(A.vol(kick, 0.98), hats, clap)
+const bigDrums = A.sum(A.vol(kick, 0.98), ghostKick, hats, clap, perc)
+
+const intro = A.sum(A.vol(pads, A.fadeIn(bar(6))), introSwell)
+
+const build1 = A.sum(
+  A.vol(kick, A.fadeIn(bar(4), bar(4))),
+  A.vol(hats, A.fadeIn(bar(6))),
+  pads,
+  A.vol(bass, A.fadeIn(bar(6))),
+  A.vol(riser8, 1)
+)
+
+const drop1 = A.sum(coreDrums, bass, pads, arp)
+
+const breakdown = A.sum(A.vol(pads, 1.35), A.vol(arpDark, A.fadeIn(bar(2))), A.vol(reverseSwellShort, 0.55))
+
+const build2 = A.sum(
+  A.vol(kick, A.fadeIn(bar(4), bar(4))),
+  hats,
+  pads,
+  A.vol(arpDark, A.fadeOut(bar(4), bar(2))),
+  A.vol(bass, A.fadeIn(bar(6))),
+  A.vol(snareBuild, A.fadeIn(bar(8))),
+  A.vol(riser8, 1)
+)
+
+const drop2 = A.sum(bigDrums, bass, pads, arp, arpTop)
+
+const outro = A.sum(
+  A.vol(kick, A.fadeOut(bar(6), 0)),
+  A.vol(bass, A.fadeOut(bar(8), 0)),
+  A.vol(hats, A.fadeOut(bar(10), 0)),
+  A.vol(pads, A.fadeOut(bar(16), 0)),
+  A.vol(arpDark, A.fadeOut(bar(14), 0))
+)
+
+const arrangement = A.song(
+  A.section(intro, bar(16)),
+  A.section(build1, bar(8)),
+  A.section(drop1, bar(32)),
+  A.section(breakdown, bar(16)),
+  A.section(build2, bar(8)),
+  A.section(drop2, bar(32)),
+  A.section(outro, bar(16))
+)
+
+A.icomp(arrangement, { thresholdDb: -9, ratio: 3.4, kneeDb: 4, attackSec: 0.004, releaseSec: 0.14, makeupDb: 1.3 })

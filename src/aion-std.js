@@ -504,6 +504,35 @@ const Æ = (() => {
   // The `voices` is always a 1d-array of functions. All sequencers support `null` or `undefined`
   // entries within the `voices` array.
 
+  const STRAIGHT_STEPS = {
+    index: (p) => Math.floor(p),
+    start: (idx) => idx,
+  }
+
+  const sequencerTiming = (opts) => opts?.timing ?? STRAIGHT_STEPS
+
+  // Long-short step timing for shuffle/swing grooves.
+  //
+  // `amount` is the step fraction moved from every odd step to the previous even step.
+  // `1 / 3` creates a classic 2:1 triplet shuffle.
+  const shuffle = (amount = 1 / 3) => {
+    const a = Math.max(-0.95, Math.min(0.95, amount))
+    const split = 1 + a
+
+    return {
+      timing: {
+        index: (p) => {
+          const pair = Math.floor(p / 2) * 2
+          return p - pair < split ? pair : pair + 1
+        },
+        start: (idx) => {
+          const pair = Math.floor(idx / 2) * 2
+          return idx - pair === 0 ? pair : pair + split
+        },
+      },
+    }
+  }
+
   // Step sequencer.
   //
   // Monophonic. Voices receive local time. `null` or undefined entries are skipped.
@@ -511,16 +540,17 @@ const Æ = (() => {
   // Example:
   //   - `seq([voice1, voice2, voice3, voice4], "1/4", tempoBpm(120))` plays each voice for 1/4 at 120bpm.
   //   - `seq([bd, null, null, null], "1/16", tempoBpm(120))` 4-to-the-floor
-  const seq = (voices, division, tempo) => {
+  const seq = (voices, division, tempo, opts = undefined) => {
     const safe = voices.map((v) => v ?? NULL_VOICE)
     const [num, den = 1] = division.split("/").map(Number)
     const stepsPerBeat = den / (4 * num)
+    const timing = sequencerTiming(opts)
     return (t) => {
       const p = tempo.phase(t) * stepsPerBeat
-      const idx = Math.floor(p)
+      const idx = timing.index(p)
       const slot = wrap(idx, safe.length)
       const stepsPerSec = (tempo.value(t) / 60) * stepsPerBeat
-      return safe[slot]((p - idx) / stepsPerSec)
+      return safe[slot]((p - timing.start(idx)) / stepsPerSec)
     }
   }
 
@@ -530,15 +560,18 @@ const Æ = (() => {
   //
   // NOTE: `maxVoices` is clamped to `voices.length` and the same voice is never evaluated
   //       twice as stateful functions (`delay`, `lpf`, ...) would not work properly.
-  const polyseq = (voices, division, tempo, maxVoices = undefined) => {
+  const polyseq = (voices, division, tempo, maxVoices = undefined, opts = undefined) => {
     const safe = voices.map((v) => v ?? NULL_VOICE)
     const [num, den = 1] = division.split("/").map(Number)
     const stepsPerBeat = den / (4 * num)
-    const mv = Math.min(maxVoices ?? safe.length, safe.length)
+    const timingOpts = opts ?? (typeof maxVoices === "object" ? maxVoices : undefined)
+    const timing = sequencerTiming(timingOpts)
+    const max = typeof maxVoices === "number" ? maxVoices : safe.length
+    const mv = Math.min(max, safe.length)
     const out = alloc()
     return (t) => {
       const p = tempo.phase(t) * stepsPerBeat
-      const idx = Math.floor(p)
+      const idx = timing.index(p)
       const stepsPerSec = (tempo.value(t) / 60) * stepsPerBeat
       let l = 0,
         r = 0
@@ -546,7 +579,7 @@ const Æ = (() => {
         const j = idx - k
         if (j < 0) break
         const slot = wrap(j, safe.length)
-        const [vl, vr] = safe[slot]((p - j) / stepsPerSec)
+        const [vl, vr] = safe[slot]((p - timing.start(j)) / stepsPerSec)
         l += vl
         r += vr
       }
@@ -1152,6 +1185,7 @@ const Æ = (() => {
     ibuf,
 
     // sequencers
+    shuffle,
     seq,
     polyseq,
 

@@ -1,4 +1,5 @@
-```js
+// composed by opus 4.7
+
 const BPM = 126
 const tempo = Æ.tempoLfo(Æ.tempoBpm(BPM), 0.7, 0.04)
 const barSec = Æ.sec("1", BPM)
@@ -20,16 +21,7 @@ const sidechain = (f) => {
   }
 }
 
-const kick = Æ.seq(
-  [
-    Æ.kick({ tuneHz: 23, decaySec: 0.45, pitchDecaySec: 0.075 }),
-    null,
-    null,
-    null,
-  ],
-  "1/16",
-  tempo
-)
+const kick = Æ.seq([Æ.kick({ tuneHz: 23, decaySec: 0.45, pitchDecaySec: 0.075 }), null, null, null], "1/16", tempo)
 
 const hats = Æ.seq(
   [
@@ -79,7 +71,7 @@ const clap = Æ.seq(
 
 const acidVoice = (note, accent = false, decaySec = 0.22) => {
   const lfo = Æ.lfo(1, 1)
-  const opts = { accent, cutoffHz: (accent ? 360 : 230), envModOct: accent ? 4.4 : 2.6, q: 11, decaySec }
+  const opts = { accent, cutoffHz: accent ? 360 : 230, envModOct: accent ? 4.4 : 2.6, q: 11, decaySec }
   const acid = Æ.iacid(Æ.pitch(note), opts)
   return (t) => {
     opts.cutoffHz = (accent ? 360 : 230) + lfo(t, 1000)
@@ -201,18 +193,9 @@ const loopSwell = Æ.timeRepeat((t) => (t > swellStart ? reverseSwell(t) : ZERO)
 const bar = (n) => barSec * n
 
 // Section mixes -- each picks a subset of the layers above.
-const introMix = Æ.sum(
-  Æ.vol(kick, Æ.fadeIn(bar(2), 0)),
-  Æ.vol(hats, Æ.fadeIn(bar(4), bar(2))),
-)
+const introMix = Æ.sum(Æ.vol(kick, Æ.fadeIn(bar(2), 0)), Æ.vol(hats, Æ.fadeIn(bar(4), bar(2))))
 
-const verseMix = Æ.sum(
-  Æ.vol(kick, 0.95),
-  hats,
-  clap,
-  pads,
-  sidechain(guitar),
-)
+const verseMix = Æ.sum(Æ.vol(kick, 0.95), hats, clap, pads, sidechain(guitar))
 
 const buildMix = Æ.sum(
   Æ.vol(kick, 0.95),
@@ -220,52 +203,36 @@ const buildMix = Æ.sum(
   clap,
   pads,
   sidechain(guitar),
-  Æ.vol(sidechain(acid), Æ.fadeIn(bar(6), 0)),  // acid swells in across the build
-  Æ.vol(loopSwell, Æ.fadeIn(bar(6), 0)),
+  Æ.vol(sidechain(acid), Æ.fadeIn(bar(6), 0)), // acid swells in across the build
+  Æ.vol(loopSwell, Æ.fadeIn(bar(6), 0))
 )
 
-const dropMix = Æ.sum(
-  Æ.vol(kick, 0.95),
-  hats,
-  clap,
-  pads,
-  sidechain(guitar),
-  sidechain(acid),
-  sidechain(lead),
-)
+const dropMix = Æ.sum(Æ.vol(kick, 0.95), hats, clap, pads, sidechain(guitar), sidechain(acid), sidechain(lead))
 
-const bridgeMix = Æ.sum(
-  Æ.vol(kick, 0.4),
-  Æ.vol(pads, 1.2),
-  Æ.vol(sidechain(guitar), 0.7),
-)
+const bridgeMix = Æ.sum(Æ.vol(kick, 0.4), Æ.vol(pads, 1.2), Æ.vol(sidechain(guitar), 0.7))
 
 const buildupMix = Æ.sum(
-  Æ.vol(kick, Æ.fadeOut(bar(4), 0)),  // kick falls away into the drop
+  Æ.vol(kick, Æ.fadeOut(bar(4), 0)), // kick falls away into the drop
   Æ.vol(hats, Æ.fadeIn(bar(3), 0)),
-  Æ.vol(loopSwell, Æ.fadeIn(bar(4), 0)),
+  Æ.vol(loopSwell, Æ.fadeIn(bar(4), 0))
 )
 
-const outroMix = Æ.sum(
-  Æ.vol(pads, Æ.fadeOut(bar(6), bar(2))),
-  Æ.vol(sidechain(guitar), Æ.fadeOut(bar(4), bar(2))),
-)
+const outroMix = Æ.sum(Æ.vol(pads, Æ.fadeOut(bar(6), bar(2))), Æ.vol(sidechain(guitar), Æ.fadeOut(bar(4), bar(2))))
 
 // 12 sections, ~124 bars (~2:25 at 126 BPM)
 const arrangement = Æ.song(
-  Æ.section(introMix,   bar(8)),
-  Æ.section(verseMix,   bar(16)),
-  Æ.section(buildMix,   bar(8)),
-  Æ.section(dropMix,    bar(8)),
-  Æ.section(bridgeMix,  bar(8)),
-  Æ.section(verseMix,   bar(16)),
-  Æ.section(buildMix,   bar(8)),
-  Æ.section(dropMix,    bar(8)),
-  Æ.section(bridgeMix,  bar(8)),
+  Æ.section(introMix, bar(8)),
+  Æ.section(verseMix, bar(16)),
+  Æ.section(buildMix, bar(8)),
+  Æ.section(dropMix, bar(8)),
+  Æ.section(bridgeMix, bar(8)),
+  Æ.section(verseMix, bar(16)),
+  Æ.section(buildMix, bar(8)),
+  Æ.section(dropMix, bar(8)),
+  Æ.section(bridgeMix, bar(8)),
   Æ.section(buildupMix, bar(4)),
-  Æ.section(dropMix,    bar(8)),
-  Æ.section(outroMix,   bar(8)),
+  Æ.section(dropMix, bar(8)),
+  Æ.section(outroMix, bar(8))
 )
 
 Æ.icomp(arrangement, { thresholdDb: -9, ratio: 3, kneeDb: 5, attackSec: 0.004, releaseSec: 0.12, makeupDb: 1.5 })
-```

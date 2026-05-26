@@ -257,14 +257,17 @@ const out = Æ.alloc()                      // pre-allocate sample pair (optiona
 
 ### Sequencers
 
-| Symbol      | Type                                                                                                      | Pure | Description                | Example                         |
-| ----------- | --------------------------------------------------------------------------------------------------------- | ---- | -------------------------- | ------------------------------- |
-| `Æ.seq`     | `(voices: ((t: number) -> Pair)[], div: string, tempo: Tempo) -> (t: number) -> Pair`                     | ✓    | Monophonic step sequencer. | `Æ.seq([v1, v2], "1/4", tempo)` |
-| `Æ.polyseq` | `(voices: ((t: number) -> Pair)[], div: string, tempo: Tempo, maxVoices: number?) -> (t: number) -> Pair` | ✓    | Polyphonic step sequencer. | `Æ.polyseq(vs, "1/16", tempo)`  |
+| Symbol      | Type                                                                                                                               | Pure | Description                | Example                         |
+| ----------- | ---------------------------------------------------------------------------------------------------------------------------------- | ---- | -------------------------- | ------------------------------- |
+| `Æ.shuffle` | `(amount: number?) -> SequencerOptions`                                                                                            | ✓    | Long-short step timing.    | `Æ.shuffle(1 / 3)`              |
+| `Æ.seq`     | `(voices: ((t: number) -> Pair)[], div: string, tempo: Tempo, opts: SequencerOptions?) -> (t: number) -> Pair`                     | ✓    | Monophonic step sequencer. | `Æ.seq([v1, v2], "1/4", tempo)` |
+| `Æ.polyseq` | `(voices: ((t: number) -> Pair)[], div: string, tempo: Tempo, maxVoices: number?, opts: SequencerOptions?) -> (t: number) -> Pair` | ✓    | Polyphonic step sequencer. | `Æ.polyseq(vs, "1/16", tempo)`  |
 
 `polyseq` backtracks at most `min(maxVoices, voices.length)` voices. The same voice is never evaluated twice so that impure functions behave as expected.
 
 **Note:** Voices receive _local time_ starting at `0` for each voice. `null` in the array is converted to `NULL_VOICE`.
+
+`shuffle(amount)` delays every odd step by stretching each even/odd pair into long-short timing. `amount` is clamped to `[-0.95, 0.95]`; `0` is straight timing and the default `1 / 3` creates a 2:1 triplet shuffle. Use it as `Æ.seq(vs, "1/16", tempo, Æ.shuffle())`, `Æ.polyseq(vs, "1/16", tempo, Æ.shuffle())`, or `Æ.polyseq(vs, "1/16", tempo, 4, Æ.shuffle())`.
 
 ### Synths
 
