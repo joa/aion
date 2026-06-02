@@ -73,3 +73,10 @@ stopBtn.addEventListener("click", async () => {
 })
 
 applyBtn.addEventListener("click", () => host.apply(codeEl.value))
+
+codeEl.addEventListener("keydown", (e) => {
+  if (e.ctrlKey && e.key === "Enter") {
+    e.preventDefault()
+    host.apply(codeEl.value)
+  }
+})
