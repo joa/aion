@@ -21,11 +21,26 @@ class AionProcessor extends AudioWorkletProcessor {
       const fixedCode = code.replace(/\n\s*\n(\s*)([([])/g, "\n\n$1;$2") // prepend a defensive ; to ( or [ to dodge ASI for blank lines
       const ctor = new Function("$", "sampleRate", `return eval(${JSON.stringify(fixedCode)})`)
       const fn = ctor(this.#self, sampleRate)
-      if (typeof fn !== "function") {
-        // TODO(joa): add support for `{ foo: (t) => .., _ignored: (t) => .., bar: (t) => .. }`
-        throw new TypeError("code must evaluate to a function")
+      if (typeof fn === "function") {
+        this.#fn = fn
+      } else if (typeof fn === "object" && fn !== null) {
+        const fns = Object.entries(fn).filter(([key]) => !key.startsWith("_")).map(([, f]) => f)
+        const out = new Float64Array(2)
+        if (fns.length === 0) throw new TypeError("object must have at least one active key")
+        this.#fn = (t) => {
+          let l = 0, r = 0
+          for (const f of fns) {
+            const [fl, fr] = f(t)
+            l += fl
+            r += fr
+          }
+          out[0] = l
+          out[1] = r
+          return out
+        }
+      } else {
+        throw new TypeError("code must evaluate to a function or object")
       }
-      this.#fn = fn
       this.port.postMessage({ type: "compiled" })
     } catch (err) {
       this.port.postMessage({ type: "error", message: String(err) })
