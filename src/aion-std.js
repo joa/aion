@@ -1070,7 +1070,7 @@ const Æ = (() => {
 
   // Synthetic snare.
   //
-  // Tonal sine at `tuneHz` blended with deterministic noise.
+  // Tuned shell body, band-shaped noise, and a short broadband crack.
   const snare = (opts = {}) => {
     const attackSec = opts.attackSec ?? 0.001
     const decaySec = opts.decaySec ?? 0.18
@@ -1078,6 +1078,8 @@ const Æ = (() => {
     const noiseAmt = opts.noiseAmt ?? 0.7
     const snap = opts.snap ?? 0.35
     const tonalAmt = 1 - noiseAmt
+    const ringHz = tuneHz * 1.62
+    const lowRingHz = tuneHz * 0.53
     const out = alloc()
     return (t) => {
       if (t <= 0) {
@@ -1086,30 +1088,46 @@ const Æ = (() => {
         return out
       }
       const frame = Math.floor(t * sampleRate)
-      const amp = t < attackSec ? t / attackSec : Math.exp(-(t - attackSec) / decaySec)
-      const bodyEnv = Math.exp(-t / (decaySec * 0.65))
-      const snapEnv = Math.exp(-t / 0.018)
+      const hit = t < attackSec ? t / attackSec : 1
+      const bodyEnv = hit * Math.exp(-t / (decaySec * 0.72))
+      const noiseEnv = hit * Math.exp(-t / decaySec)
+      const crackEnv = hit * Math.exp(-t / 0.012)
+      const rattleEnv = hit * Math.exp(-t / (decaySec * 1.45))
+
+      const pitchDrop = 1 + 0.35 * Math.exp(-t / 0.026)
+      const body =
+        (sin(t, tuneHz * pitchDrop) * 0.62 + sin(t, ringHz) * 0.24 + tri(t, lowRingHz) * 0.14) * tonalAmt * bodyEnv
+
       const whiteL = noise(frame + 17)
       const whiteR = noise(frame + 113)
-      const bandL = (whiteL - 0.55 * noise(frame - 7)) * 0.7
-      const bandR = (whiteR - 0.55 * noise(frame - 11)) * 0.7
-      const body = (sin(t, tuneHz) * 0.7 + sin(t, tuneHz * 1.52) * 0.3) * tonalAmt * bodyEnv
-      out[L] = (body + bandL * noiseAmt * amp + whiteL * snap * snapEnv) * 0.34
-      out[R] = (body + bandR * noiseAmt * amp + whiteR * snap * snapEnv) * 0.34
+      const brightL = whiteL - 0.72 * noise(frame - 5) + 0.34 * noise(frame - 23) - 0.12 * noise(frame - 71)
+      const brightR = whiteR - 0.72 * noise(frame - 7) + 0.34 * noise(frame - 31) - 0.12 * noise(frame - 89)
+      const midL = noise(frame + 211) - 0.52 * noise(frame - 97) + 0.2 * noise(frame - 251)
+      const midR = noise(frame + 313) - 0.52 * noise(frame - 131) + 0.2 * noise(frame - 337)
+      const bandL = brightL * 0.52 + midL * 0.34
+      const bandR = brightR * 0.52 + midR * 0.34
+      const crackL = (whiteL - noise(frame - 1)) * crackEnv
+      const crackR = (whiteR - noise(frame - 3)) * crackEnv
+      const tailL = (noise(frame + 503) - noise(frame - 377)) * rattleEnv * 0.16
+      const tailR = (noise(frame + 709) - noise(frame - 419)) * rattleEnv * 0.16
+
+      out[L] = (body + bandL * noiseAmt * noiseEnv + crackL * snap * 0.72 + tailL * noiseAmt) * 0.31
+      out[R] = (body * 0.96 + bandR * noiseAmt * noiseEnv + crackR * snap * 0.72 + tailR * noiseAmt) * 0.31
       return out
     }
   }
 
   // Synthetic Hihat.
   //
-  // Deterministic noise + a high sine shimmer.
-  //`open: true` switches to a long decay for the open variant; closed is a 50 ms tick.
+  // Inharmonic metal partials plus high-passed noise and a thin air layer.
+  // `open: true` switches to a long decay for the open variant; closed is a tight tick.
   const hihat = (opts = {}) => {
     const open = opts.open ?? false
     const attackSec = opts.attackSec ?? 0.001
     const decaySec = opts.decaySec ?? (open ? 0.35 : 0.05)
     const shimmerHz = opts.shimmerHz ?? 7000
     const tone = opts.tone ?? 0.18
+    const chokeSec = open ? decaySec * 0.55 : decaySec * 0.42
     const out = alloc()
     return (t) => {
       if (t <= 0) {
@@ -1118,15 +1136,31 @@ const Æ = (() => {
         return out
       }
       const frame = Math.floor(t * sampleRate)
-      const amp = t < attackSec ? t / attackSec : Math.exp(-(t - attackSec) / decaySec)
+      const hit = t < attackSec ? t / attackSec : 1
+      const bodyEnv = hit * Math.exp(-t / chokeSec)
+      const airEnv = hit * Math.exp(-t / decaySec)
+      const tickEnv = hit * Math.exp(-t / 0.006)
+
       const n0 = noise(frame + 31)
       const n1 = noise(frame - 5)
       const n2 = noise(frame - 19)
-      const bright = n0 - 0.62 * n1 + 0.28 * n2
-      const metal = (square(t, shimmerHz) + square(t, shimmerHz * 1.342) + square(t, shimmerHz * 1.731)) / 3
-      const s = (bright * (1 - tone) + metal * tone) * amp * 0.16
-      out[L] = s
-      out[R] = s * 0.92 + bright * amp * 0.012
+      const n3 = noise(frame - 83)
+      const n4 = noise(frame + 167)
+      const hpL = n0 - 0.78 * n1 + 0.42 * n2 - 0.18 * n3
+      const hpR = noise(frame + 97) - 0.78 * noise(frame - 37) + 0.42 * noise(frame - 61) - 0.18 * noise(frame - 131)
+      const airL = (n4 - noise(frame - 233)) * 0.32
+      const airR = (noise(frame + 269) - noise(frame - 307)) * 0.32
+      const metal =
+        square(t, shimmerHz * 0.49) * 0.18 +
+        square(t, shimmerHz * 0.73) * 0.2 +
+        square(t, shimmerHz * 1.0) * 0.24 +
+        square(t, shimmerHz * 1.342) * 0.2 +
+        square(t, shimmerHz * 1.731) * 0.18
+      const stick = (n0 - noise(frame - 1)) * tickEnv * 0.42
+      const body = (hpL * (1 - tone) + metal * tone) * bodyEnv
+      const bodyR = (hpR * (1 - tone) + metal * 0.92 * tone) * bodyEnv
+      out[L] = (body + airL * airEnv + stick) * 0.13
+      out[R] = (bodyR + airR * airEnv - stick * 0.18) * 0.13
       return out
     }
   }
