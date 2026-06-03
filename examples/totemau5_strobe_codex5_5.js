@@ -28,9 +28,9 @@ const sidechain = (f, depth = 1) => {
 }
 
 // Drums: restrained progressive-house kit, leaving space for the plucks.
-const kick = A.seq(A.pattern("#---", A.kick({ tuneHz: 31, decaySec: 0.46, pitchDecaySec: 0.06 })), "1/16", tempo)
+const kick = A.seq(A.pattern("#---", A.kick({ tuneHz: 24, decaySec: 0.1, pitchDecaySec: 0.06 })), "1/16", tempo)
 const ghostKick = A.seq(
-  A.pattern("-------#------#-", A.vol(A.kick({ tuneHz: 43, decaySec: 0.18, pitchDecaySec: 0.06 }), 0.16)),
+  A.pattern("-------#------#-", A.vol(A.kick({ tuneHz: 43, decaySec: 0.08, pitchDecaySec: 0.06 }), 0.06)),
   "1/16",
   tempo
 )
