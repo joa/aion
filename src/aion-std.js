@@ -1647,6 +1647,8 @@ const Æ = (() => {
       ...opts.amp,
       releaseTime: gateSec,
     })
+    // Sequencers keep finished notes alive while they overlap; skip the work once the release is over.
+    const silentAfterSec = gateSec + (opts.amp?.releaseSec ?? 0.2)
     const filterEnv = adsr({
       attackSec: 0.001,
       decaySec: 0.25,
@@ -1676,6 +1678,11 @@ const Æ = (() => {
 
     const render = (n) => {
       const t = n / sr
+      if (t >= silentAfterSec) {
+        out[L] = 0
+        out[R] = 0
+        return
+      }
       const f0 = E(t, hz)
       let l = 0,
         r = 0

@@ -20,12 +20,14 @@ const startBtn = document.getElementById("start")
 const stopBtn = document.getElementById("stop")
 const applyBtn = document.getElementById("apply")
 
+const DEFAULT_EXAMPLE = "machine_heart.js"
+
 const examples = Object.entries(exampleModules)
   .map(([path, code]) => ({
     name: path.split("/").pop(),
     code,
   }))
-  .sort((a, b) => (a.name === "default.js" ? -1 : b.name === "default.js" ? 1 : a.name.localeCompare(b.name)))
+  .sort((a, b) => (a.name === DEFAULT_EXAMPLE ? -1 : b.name === DEFAULT_EXAMPLE ? 1 : a.name.localeCompare(b.name)))
 
 const setStatus = (text, kind = "info") => {
   statusEl.textContent = text
@@ -54,7 +56,7 @@ const loadExample = (name) => {
   setStatus(`loaded ${example.name}`, "info")
 }
 
-loadExample("default.js")
+loadExample(DEFAULT_EXAMPLE)
 
 exampleEl.addEventListener("change", () => loadExample(exampleEl.value))
 
