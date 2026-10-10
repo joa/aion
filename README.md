@@ -75,7 +75,7 @@ const sin = (t, hz) => Math.sin(t * hz * 2 * Math.PI) // produce a sine wave
 const saw = (t, hz) => { // produce a saw wave
   const p = t * hz
   return 2 * (p - Math.floor(p)) - 1
-} 
+}
 const synth = (hz, osc) => (t) => [osc(t, hz), osc(t, hz)] // convert an oscillator to a stereo signal
 sum(
   // add the signals together
@@ -128,13 +128,15 @@ Every oscillator has the form `Osc`.
 | ----------- | ----------------------- | ---- | ----------------------------------------- | --------------------------------------- |
 | `Æ.sin`     | `Osc`                   | ✓    | Sine wave in `[-1, 1]`.                   | `t => Æ.sin(t, 440)`                    |
 | `Æ.cos`     | `Osc`                   | ✓    | Cosine wave in `[-1, 1]`.                 | `t => Æ.cos(t, 440)`                    |
-| `Æ.saw`     | `Osc`                   | ✓    | Saw wave in `[-1, 1]`.                    | `t => Æ.saw(t, 440)`                    |
-| `Æ.suprsaw` | `Osc`                   | ✓    | Layered and detuned saw waves.            | `t => Æ.suprsaw(t, 440)`                |
+| `Æ.saw`     | `Osc`                   | ✓    | Band-limited (PolyBLEP) saw in `[-1, 1]`. | `t => Æ.saw(t, 440)`                    |
+| `Æ.suprsaw` | `Osc` + `detune`, `mix` | ✓    | JP-8000 style seven-saw super saw.        | `t => Æ.suprsaw(t, 440)`                |
 | `Æ.tri`     | `Osc`                   | ✓    | Triangle wave in `[-1, 1]`.               | `t => Æ.tri(t, 440)`                    |
-| `Æ.square`  | `Osc`                   | ✓    | Square wave in `[-1, 1]`.                 | `t => Æ.square(t, 440)`                 |
+| `Æ.square`  | `Osc`                   | ✓    | Band-limited (PolyBLEP) square.           | `t => Æ.square(t, 440)`                 |
 | `Æ.bell`    | `Osc`                   | ✓    | Bell-shape oscillator (0.5 - 0.5 \* cos). | `t => Æ.bell(t, 1)`                     |
 | `Æ.stepSin` | `(n: number) -> Osc`    | ✓    | Creates a sine oscillator with `n` steps. | `const osc = Æ.stepSin(8); osc(t, 440)` |
 | `Æ.noise`   | `(t: number) -> number` | ✓    | Deterministic pseudo-random noise.        | `t => Æ.noise(t)`                       |
+| `Æ.valueNoise` | `Osc` (+ `seed`)     | ✓    | Smooth noise, lowpassed at `hz`.          | `t => Æ.valueNoise(t, 800)`             |
+| `Æ.bandNoise` | `(t, centerHz, widthHz, seed?) -> number` | ✓ | Noise in `centerHz ± widthHz`.    | `t => Æ.bandNoise(t, 5000, 2000)`       |
 
 ### Utilities
 
@@ -163,7 +165,7 @@ Every oscillator has the form `Osc`.
 | Symbol      | Type                                                                       | Pure | Description                                                                                               | Example                           |
 | ----------- | -------------------------------------------------------------------------- | ---- | --------------------------------------------------------------------------------------------------------- | --------------------------------- |
 | `Æ.lfo`     | `(hz: number, amp: number = 1, center: number = 0, f: Osc = Æ.sin) -> Env` | ✓    | LFO envelope.                                                                                             | `Æ.lfo(1, 500, 1000)`             |
-| `Æ.adsr`    | `(opts: AdsrOptions) -> Env`                                               | ✓    | Attack-Decay-Sustain-Release envelope.                                                                    | `Æ.adsr({ attackSec: 0.1, ... })` |
+| `Æ.adsr`    | `(opts: AdsrOptions) -> Env`                                               | ✓    | ADSR envelope with analog-style exponential decay and release.                                           | `Æ.adsr({ attackSec: 0.1, ... })` |
 | `Æ.fadeIn`  | `(durSec: number, startSec: number = 0) -> Env`                            | ✓    | Linear fade-in. 0 before `startSec`, ramp to 1 over `durSec`, 1 after.                                    | `Æ.fadeIn(2)`                     |
 | `Æ.fadeOut` | `(durSec: number, startSec: number) -> Env`                                | ✓    | Linear fade-out. 1 before `startSec`, ramp to 0 over `durSec`, 0 after.                                   | `Æ.fadeOut(2, 4)`                 |
 | `Æ.window`  | `(startSec: number, endSec: number, fadeSec: number = 0.05) -> Env`        | ✓    | Time-window envelope. 1 during `[startSec, endSec)` with `fadeSec` ramps at both edges; otherwise 0.      | `Æ.window(1, 3)`                  |
@@ -271,13 +273,16 @@ const out = Æ.alloc()                      // pre-allocate sample pair (optiona
 
 ### Synths
 
-| Symbol       | Type                                                               | Pure | Description                   | Example                       |
-| ------------ | ------------------------------------------------------------------ | ---- | ----------------------------- | ----------------------------- |
-| `Æ.pluck`    | `(hz: Env \| number, f: Osc) -> (t: number) -> Pair`               | ✓    | Synth with short ADSR curve.  | `Æ.pluck(440, Æ.saw)`         |
-| `Æ.pad`      | `(hz: Env \| number, f: Osc) -> (t: number) -> Pair`               | ✓    | Synth with long ADSR release. | `Æ.pad(220, Æ.sin)`           |
-| `Æ.iacid`    | `(hz: Env \| number, opts: AcidOptions) -> (t: number) -> Pair`    | ✗    | Acid synth.                   | `Æ.iacid(Æ.pitch("C2"))`      |
-| `Æ.ikarplus` | `(hz: Env \| number, opts: KarplusOptions) -> (t: number) -> Pair` | ✗    | Karplus-Strong guitar.        | `Æ.ikarplus(110)`             |
-| `Æ.fm2`      | `(hz: Env \| number, opts: Fm2Options) -> (t: number) -> Pair`     | ✓    | 2-operator FM synth.          | `Æ.fm2(440, { modIndex: 8 })` |
+| Symbol             | Type                                                                                   | Pure | Description                   | Example                         |
+| ------------------ | -------------------------------------------------------------------------------------- | ---- | ----------------------------- | ------------------------------- |
+| `Æ.pluck`          | `(hz: Env \| number, f: Osc, detuneCents = 3) -> (t: number) -> Pair`                                   | ✓    | Short ADSR, stereo detuned.   | `Æ.pluck(440, Æ.saw)`           |
+| `Æ.pad`            | `(hz: Env \| number, f: Osc, detuneCents = 7) -> (t: number) -> Pair`                                   | ✓    | Long ADSR, stereo detuned.    | `Æ.pad(220, Æ.sin)`             |
+| `Æ.iacid`          | `(hz: Env \| number, opts: AcidOptions) -> (t: number) -> Pair`                        | ✗    | Acid synth.                   | `Æ.iacid(Æ.pitch("C2"))`        |
+| `Æ.isynth`         | `(hz: Env \| number, opts: SynthOptions) -> (t: number) -> Pair`                       | ✗    | Virtual-analog synth voice.   | `Æ.isynth(110, { sub: 0.5 })`   |
+| `Æ.ikarplus`       | `(hz: Env \| number, opts: KarplusOptions) -> (t: number) -> Pair`                     | ✗    | Karplus-Strong guitar.        | `Æ.ikarplus(110)`               |
+| `Æ.formantSpeech`  | `(text: string \| SpeechSegment[], opts: FormantSpeechOptions) -> (t: number) -> Pair` | ✓    | Formant speech synthesizer.   | `Æ.formantSpeech("hello aion")` |
+| `Æ.speechPhonemes` | `{ [name: string]: SpeechPhoneme }`                                                    | ✓    | Built-in formant phoneme map. | `Æ.speechPhonemes.AH`           |
+| `Æ.fm2`            | `(hz: Env \| number, opts: Fm2Options) -> (t: number) -> Pair`                         | ✓    | DX7-style 2-operator FM.      | `Æ.fm2(440, { modIndex: 8 })`   |
 
 #### AcidOptions
 
@@ -289,6 +294,30 @@ const out = Æ.alloc()                      // pre-allocate sample pair (optiona
   q:         Env | number               = 6
   decaySec:  Env | number               = 0.3
   accent:    bool | (t: number) -> bool = false
+}
+```
+
+#### SynthOptions
+
+Unison oscillators into drive and a resonant lowpass with its own envelope. Numbers may also be functions of `t`, except `voices`, `detuneCents`, `spread` and `gateSec`.
+
+```js
+{
+  wave:        "saw" | "square" | Osc = "saw"
+  voices:      number = 3         // unison
+  detuneCents: number = 12
+  spread:      number = 0.7       // stereo width of the unison
+  sub:         number = 0         // square one octave down
+  noise:       number = 0
+  cutoffHz:    number = 900
+  q:           number = 1
+  envOct:      number = 3         // filter envelope amount in octaves
+  keyTrack:    number = 0.5       // 1 = cutoff follows pitch fully
+  drive:       number = 1.5
+  gateSec:     number = Infinity  // note length; the release starts here
+  amp:    { attackSec = 0.003, decaySec = 0.3, sustain = 0.7, releaseSec = 0.2 }
+  filter: { attackSec = 0.001, decaySec = 0.25, sustain = 0.2, releaseSec = 0.3 }
+  gain:        number = 1
 }
 ```
 
@@ -308,8 +337,39 @@ const out = Æ.alloc()                      // pre-allocate sample pair (optiona
   ratio:       Env | number = 2
   modIndex:    Env | number = 4
   modDecaySec: Env | number = 0.3
+  modSustain:  Env | number = 0.08  // index after the decay, relative to modIndex
+  feedback:    Env | number = 0.2   // modulator self-feedback
+  keyScale:    number       = 0.5   // index falls above 220Hz by (220 / hz)^keyScale
+  detuneCents: number       = 4     // stereo detune
 }
 ```
+
+#### FormantSpeechOptions
+
+```js
+{
+  pitchHz:       Env | number = 120
+  gain:          number       = 0.75
+  pan:           Env | number = 0
+  rate:          number       = 1      // higher is faster
+  phonemeSec:    number       = 1      // duration multiplier
+  transitionSec: number       = 0.035
+  mouth:         Env | number = 1      // scales formant frequencies
+  breath:        Env | number = 0.22
+  vibratoHz:     Env | number = 5.2
+  vibratoDepth:  Env | number = 0.012
+  maxHarmonics:  number       = 48
+  spectralTilt:  number       = 0.85
+}
+```
+
+`Æ.formantSpeech(...)` accepts a text string for quick sketches, or a phoneme sequence for more control. It returns a normal stereo signal and carries `.dur` with the generated phrase length in seconds, and `.spectralEnvelope` for `Æ.ivocoder`.
+
+```js
+Æ.formantSpeech([{ phoneme: "HH", durSec: 0.08 }, "EH", "L", "OW", { phoneme: "SP", durSec: 0.12 }, "EY", "AA", "N"])
+```
+
+Built-in phonemes: `SP`, `AA`, `AE`, `AH`, `AO`, `AW`, `EH`, `ER`, `EY`, `IH`, `IY`, `OW`, `OY`, `UH`, `UW`, `B`, `D`, `F`, `G`, `H`, `K`, `L`, `M`, `N`, `NG`, `P`, `R`, `S`, `SH`, `T`, `TH`, `V`, `W`, `Y`, `Z`, `ZH`.
 
 ### Drums
 
@@ -326,6 +386,8 @@ const out = Æ.alloc()                      // pre-allocate sample pair (optiona
   decaySec:      number = 0.3
   tuneHz:        number = 50
   pitchDecaySec: number = 0.05
+  drive:         number = 1.8   // tanh saturation
+  click:         number = 0.5   // beater click level
 }
 ```
 
@@ -364,6 +426,9 @@ const out = Æ.alloc()                      // pre-allocate sample pair (optiona
 | `Æ.iphaser`  | `(f: (t: number) -> Pair, rateHz: number = 0.5, depth: number = 1, stages: number = 4, n: number = 256) -> (t: number) -> Pair`                 | ✗    | Phaser effect.                    | `Æ.iphaser(f)`              |
 | `Æ.distort`  | `(f: (t: number) -> Pair, drive: number = 3, kind: "soft" \| "hard" = "soft") -> (t: number) -> Pair`                                           | ✓    | Soft/Hard clipping.               | `Æ.distort(f, 5, "hard")`   |
 | `Æ.icomp`    | `(f: (t: number) -> Pair, opts: CompressorOptions) -> (t: number) -> Pair`                                                           | ✗    | Soft-knee compressor.             | `Æ.icomp(f, { ratio: 4 })`  |
+| `Æ.isvf`     | `(f: (t: number) -> Pair, cutoffHz: Env \| number = 1000, q: Env \| number = 0.707, mode: "lp" \| "bp" \| "hp" = "lp") -> (t: number) -> Pair` | ✗ | Sweepable resonant filter. | `Æ.isvf(f, (t) => 200 + 2000 * t)` |
+| `Æ.ireverb`  | `(f: (t: number) -> Pair, opts: ReverbOptions) -> (t: number) -> Pair` | ✗ | FDN reverb. | `Æ.ireverb(f, { decaySec: 3 })` |
+| `Æ.ivocoder` | `(carrier: (t: number) -> Pair, modulator: (t: number) -> Pair, opts: VocoderOptions) -> (t: number) -> Pair`                        | ✗    | Channel vocoder.                  | `Æ.ivocoder(synth, voice)`  |
 
 #### CompressorOptions
 ```js
@@ -378,6 +443,45 @@ const out = Æ.alloc()                      // pre-allocate sample pair (optiona
   capacitySec: number              = 0.5
 }
 ```
+
+#### ReverbOptions
+
+```js
+{
+  decaySec:    number = 2      // RT60
+  dampHz:      number = 5000
+  preDelaySec: number = 0.015
+  size:        number = 1
+  mix:         number = 0.25   // 1 = wet only, for a send bus
+  width:       number = 1
+}
+```
+
+Stateful effects need monotonic time. `Æ.song` restarts time in every section, so a reverb inside a section loses its tail at each boundary; put it on a send bus outside the song instead, like `examples/machine_heart.js` does.
+
+#### VocoderOptions
+```js
+{
+  bands:      number = 20
+  lowHz:      number = 120
+  highHz:     number = 8000
+  q:          number = 1      // > 1 narrows the bands
+  attackSec:  number = 0.004  // envelope followers, analysis mode only
+  releaseSec: number = 0.03
+  noise:      number = 0.4    // carrier noise for unvoiced phonemes; 0 and constant in analysis mode
+  gain:       number = 1
+}
+```
+
+When the modulator is an `Æ.formantSpeech(...)`, the vocoder reads its spectral envelope directly instead of analyzing the audio, so there is no envelope lag and consonants get noise. Pass the speech directly: wrappers such as `vol`, `pan` or `timeRepeat` hide `.spectralEnvelope` and the vocoder falls back to analysis. Any other stereo signal works as a modulator too.
+
+```js
+const voice = Æ.formantSpeech("we are the robots", { rate: 0.8 })
+const saw = (hz) => (t) => Æ.stereo(Æ.suprsaw(t, hz) * 0.1)
+Æ.ivocoder(Æ.chord(saw, "C3", "Eb3", "G3"), voice)
+```
+
+See `examples/vocoder.js`.
 
 ---
 

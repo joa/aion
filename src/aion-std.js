@@ -43,21 +43,43 @@ const Æ = (() => {
 
   const cos = (t, hz) => Math.cos(t * hz * TAU)
 
-  const saw = (t, hz) => {
-    const p = t * hz
-    return 2 * (p - Math.floor(p)) - 1
+  // PolyBLEP residual of a unit step at phase 0 (Välimäki & Huovilainen, "Antialiasing Oscillators in Subtractive
+  // Synthesis", 2007). Subtracting it from a naive discontinuity band-limits the edge; `dt` is the phase increment
+  // per sample.
+  const polyBlep = (p, dt) => {
+    if (p < dt) {
+      const x = p / dt
+      return x + x - x * x - 1
+    }
+    if (p > 1 - dt) {
+      const x = (p - 1) / dt
+      return x * x + x + x + 1
+    }
+    return 0
   }
 
-  const suprsaw = (t, hz) => {
-    let s = 0.0,
-      g = 1.0,
-      norm = 0.0
-    for (let i = 0; i < 4; i++) {
-      g *= 0.5
-      s += (saw(t, hz + i) * 0.75 + 0.25 * (saw(t, hz - i * 2) + saw(t, hz + i * 2))) * g
-      norm += 1.25 * g
+  const phaseStep = (hz) => Math.min(0.5, Math.abs(hz) / sampleRate)
+
+  const saw = (t, hz) => {
+    const p = t * hz - Math.floor(t * hz)
+    return 2 * p - 1 - polyBlep(p, phaseStep(hz))
+  }
+
+  // JP-8000 super saw after Adam Szabo, "How to Emulate the Super Saw" (2010): seven saws at his measured detune
+  // offsets, a center/side balance, and fixed phase offsets so the voices never start aligned.
+  // `detune` scales the offsets (1 is the full ±11%) and `mix` moves energy from the center saw to the sides.
+  const SUPERSAW_OFFSETS = [-0.11002313, -0.06288439, -0.01952356, 0, 0.01991221, 0.06216538, 0.10745242]
+  const SUPERSAW_PHASES = [0.11, 0.63, 0.27, 0, 0.84, 0.42, 0.95]
+  const suprsaw = (t, hz, detune = 0.15, mix = 0.5) => {
+    const sideGain = -0.73764 * mix * mix + 1.2841 * mix + 0.044372
+    const centerGain = -0.55366 * mix + 0.99785
+    let s = 0
+    for (let i = 0; i < 7; i++) {
+      const voiceHz = hz * (1 + detune * SUPERSAW_OFFSETS[i])
+      s += saw(t + SUPERSAW_PHASES[i] / voiceHz, voiceHz) * (i === 3 ? centerGain : sideGain)
     }
-    return s / norm
+    // The saws are uncorrelated, so their powers add.
+    return (s * 0.55) / Math.sqrt(centerGain * centerGain + 6 * sideGain * sideGain)
   }
 
   const tri = (t, hz) => {
@@ -68,7 +90,9 @@ const Æ = (() => {
   // Centered ±1 square. For PWM, compose: `(t, hz) => (saw(t, hz) < -0.4 ? -1 : 1)`.
   const square = (t, hz) => {
     const p = t * hz - Math.floor(t * hz)
-    return p < 0.5 ? -1 : 1
+    const dt = phaseStep(hz)
+    const half = p < 0.5 ? p + 0.5 : p - 0.5
+    return (p < 0.5 ? -1 : 1) - polyBlep(p, dt) + polyBlep(half, dt)
   }
 
   const bell = (t, hz) => 0.5 - 0.5 * cos(t, hz)
@@ -81,6 +105,22 @@ const Æ = (() => {
     const x = Math.sin(t * 12.9898 + 78.233) * 43758.5453
     return 2 * (x - Math.floor(x)) - 1
   }
+
+  // Value noise: random values at `hz` blended with a smoothstep, i.e. noise lowpassed at roughly `hz`.
+  // Different `seed` values give uncorrelated streams.
+  const valueNoise = (t, hz, seed = 0) => {
+    const x = t * hz
+    const i = Math.floor(x)
+    const f = x - i
+    const a = noise(i + seed)
+    return a + (noise(i + 1 + seed) - a) * f * f * (3 - 2 * f)
+  }
+
+  // Band-limited noise in `centerHz ± widthHz`, without filter state.
+  //
+  // Ring modulation shifts the lowpassed value noise up to the carrier (heterodyning), which is the same as
+  // bandpassing white noise but costs O(1) per sample and stays pure.
+  const bandNoise = (t, centerHz, widthHz, seed = 0) => valueNoise(t, widthHz, seed) * sin(t, centerHz)
 
   // Utils
   // #####
@@ -293,7 +333,11 @@ const Æ = (() => {
     (t) =>
       center + amp * f(t, rateHz)
 
-  // ADSR envelope.
+  // Exponential segment falling from 1 at `x = 0` to exactly 0 at `x = 1`, like the RC curve of an analog
+  // envelope generator. `k` is the curvature.
+  const expFall = (x, k) => (Math.exp(-k * x) - Math.exp(-k)) / (1 - Math.exp(-k))
+
+  // ADSR envelope with analog-style exponential segments; attack, decay and release still end exactly on time.
   const adsr = ({
     triggerTime: t0 = 0,
     releaseTime: t1 = Infinity,
@@ -305,15 +349,15 @@ const Æ = (() => {
     const held = (t) => {
       const dt = t - t0
       if (dt < 0) return 0
-      if (dt < a) return dt / a
-      if (dt < a + d) return 1 - ((1 - s) * (dt - a)) / d
+      if (dt < a) return 1 - expFall(dt / a, 2)
+      if (dt < a + d) return s + (1 - s) * expFall((dt - a) / d, 2)
       return s
     }
     const peak = held(t1)
     return (t) => {
       if (t < t1) return held(t)
       const dt = t - t1
-      return dt >= r ? 0 : peak * (1 - dt / r)
+      return dt >= r ? 0 : peak * expFall(dt / r, 2)
     }
   }
 
@@ -896,32 +940,286 @@ const Æ = (() => {
     }
   }
 
-  // Synths
-  // ######
-  // Synths have always the form `f(hz, ...) -> t -> [l, r]`
+  // Impure channel vocoder (Dudley, "The Vocoder", 1939).
+  //
+  // Imposes the spectral envelope of `modulator` (usually speech) onto `carrier` (usually a rich synth) through
+  // `bands` log-spaced bandpass filters. The filters are RBJ cookbook biquads in transposed direct form II.
+  //
+  // If `modulator` carries `.spectralEnvelope` (see `formantSpeech`), the band gains are read from it directly:
+  // exact, without envelope-follower lag and without analysis filters. Unvoiced phonemes (S, SH, T, ...) then mix
+  // noise into the carrier so consonants stay intelligible. Any other modulator is analyzed by envelope followers.
+  //
+  // Options:
+  // - bands (20)
+  // - lowHz (120), highHz (8000)
+  // - q (1) scales the band Q; > 1 is narrower and more resonant
+  // - attackSec (0.004), releaseSec (0.03) of the envelope followers; analysis only
+  // - noise: carrier noise for unvoiced phonemes (0.4); in analysis mode it is mixed in constantly (0)
+  // - gain (1)
+  const ivocoder = (carrier, modulator, opts = {}) => {
+    const sr = sampleRate
+    const bands = opts.bands ?? 20
+    const lowHz = opts.lowHz ?? 120
+    const highHz = Math.min(opts.highHz ?? 8000, sr * 0.45)
+    const spectral = typeof modulator.spectralEnvelope === "function"
+    const noiseAmt = opts.noise ?? (spectral ? 0.4 : 0)
+    const attackCoef = 1 - Math.exp(-1 / ((opts.attackSec ?? 0.004) * sr))
+    const releaseCoef = 1 - Math.exp(-1 / ((opts.releaseSec ?? 0.03) * sr))
+    const followerGain = 3
+    const gain = (opts.gain ?? 1) * 3.4
 
-  // Pluck with a short ADSR env.
-  const pluck = (hz, f) => {
-    const env = adsr({ releaseTime: 0.05, attackSec: 0.005, decaySec: 0.08, sustain: 0.4, releaseSec: 0.18 })
+    // Adjacent bands are `ratio` apart; Q = sqrt(ratio) / (ratio - 1) puts the -3dB points on the band edges.
+    const ratio = Math.pow(highHz / lowHz, 1 / Math.max(1, bands - 1))
+    const q = (Math.sqrt(ratio) / (ratio - 1)) * (opts.q ?? 1)
+
+    // Constant 0dB peak gain bandpass, normalized by a0. Since b1 = 0 and b2 = -b0 we only store b0, a1, a2.
+    const bandsHz = new Float64Array(bands)
+    const b0 = new Float64Array(bands)
+    const a1 = new Float64Array(bands)
+    const a2 = new Float64Array(bands)
+    for (let i = 0; i < bands; i++) {
+      const hz = lowHz * Math.pow(ratio, i)
+      const w0 = (TAU * hz) / sr
+      const alpha = Math.sin(w0) / (2 * q)
+      const a0 = 1 + alpha
+      bandsHz[i] = hz
+      b0[i] = alpha / a0
+      a1[i] = (-2 * Math.cos(w0)) / a0
+      a2[i] = (1 - alpha) / a0
+    }
+
+    // Two delay elements per band and signal.
+    const carrierL = new Float64Array(bands * 2)
+    const carrierR = new Float64Array(bands * 2)
+    const analysis = new Float64Array(bands * 2)
+    const followers = new Float64Array(bands)
+    const gains = new Float64Array(bands)
+
+    const bandpass = (state, i, x) => {
+      const j = i * 2
+      const y = b0[i] * x + state[j]
+      state[j] = state[j + 1] - a1[i] * y
+      state[j + 1] = -b0[i] * x - a2[i] * y
+      return y
+    }
+
     const out = alloc()
+    let last = -1
+
+    const render = (frame) => {
+      const t = frame / sr
+      const [cl, cr] = carrier(t)
+      let unvoiced = 1
+      if (spectral) {
+        unvoiced = modulator.spectralEnvelope(t, bandsHz, gains)
+      } else {
+        const [ml, mr] = modulator(t)
+        const m = (ml + mr) * 0.5
+        for (let i = 0; i < bands; i++) {
+          const y = Math.abs(bandpass(analysis, i, m))
+          followers[i] += (y - followers[i]) * (y > followers[i] ? attackCoef : releaseCoef)
+          gains[i] = followers[i] * followerGain
+        }
+      }
+      const hiss = noiseAmt * unvoiced
+      const xl = cl + noise(frame) * hiss
+      const xr = cr + noise(frame + 0.5) * hiss
+      let l = 0,
+        r = 0
+      for (let i = 0; i < bands; i++) {
+        l += bandpass(carrierL, i, xl) * gains[i]
+        r += bandpass(carrierR, i, xr) * gains[i]
+      }
+      out[L] = l * gain
+      out[R] = r * gain
+    }
+
     return (t) => {
-      const s = f(t, E(t, hz)) * 0.3 * env(t)
-      out[L] = s
-      out[R] = s
+      const frame = Math.round(t * sr)
+      if (frame < last || frame > last + sr) {
+        carrierL.fill(0)
+        carrierR.fill(0)
+        analysis.fill(0)
+        followers.fill(0)
+        last = frame - 1
+      }
+      while (last < frame) render(++last)
       return out
     }
   }
 
-  // Pad with a longer ADSR env.
-  const pad = (hz, f) => {
-    const env = adsr({ releaseTime: 0.6, attackSec: 0.4, decaySec: 0.2, sustain: 0.7, releaseSec: 2.0 })
+  // One step of the zero-delay-feedback state-variable filter from Zavalishin, "The Art of VA Filter Design" (2012),
+  // on the two integrator states `state[j]` and `state[j + 1]`. `g = tan(PI * cutoffHz / sampleRate)`,
+  // `k = 1 / q`. Writes lowpass, bandpass and highpass into `svfOut`.
+  const svfOut = new Float64Array(3)
+  const svfStep = (state, j, x, g, k) => {
+    const hp = (x - (k + g) * state[j] - state[j + 1]) / (1 + k * g + g * g)
+    const bp = g * hp + state[j]
+    const lp = g * bp + state[j + 1]
+    state[j] = bp + g * hp
+    state[j + 1] = lp + g * bp
+    svfOut[0] = lp
+    svfOut[1] = bp
+    svfOut[2] = hp
+    return svfOut
+  }
+  const SVF_MODES = { lp: 0, bp: 1, hp: 2 }
+  const svfCoef = (cutoffHz) => Math.tan((Math.PI * Math.min(Math.max(cutoffHz, 10), sampleRate * 0.45)) / sampleRate)
+
+  // Impure resonant state-variable filter.
+  //
+  // Unlike `ilpf`, `cutoffHz` and `q` may be functions of t, so it sweeps. `mode` is "lp", "bp" or "hp".
+  const isvf = (f, cutoffHz = 1000, q = 0.707, mode = "lp") => {
+    const sr = sampleRate
+    const tap = SVF_MODES[mode]
+    const state = new Float64Array(4)
     const out = alloc()
+    let last = -1
     return (t) => {
-      const s = f(t, E(t, hz)) * 0.25 * env(t)
-      out[L] = s
-      out[R] = s
+      const frame = Math.round(t * sr)
+      if (frame < last || frame > last + sr) {
+        state.fill(0)
+        last = frame - 1
+      }
+      while (last < frame) {
+        last++
+        const tt = last / sr
+        const [l, r] = f(tt)
+        const g = svfCoef(E(tt, cutoffHz))
+        const k = 1 / E(tt, q)
+        out[L] = svfStep(state, 0, l, g, k)[tap]
+        out[R] = svfStep(state, 2, r, g, k)[tap]
+      }
       return out
     }
+  }
+
+  // Impure stereo reverb.
+  //
+  // An 8-line feedback delay network (Jot & Chaigne, "Digital Delay Networks for Designing Artificial
+  // Reverberators", 1991). The lines are mixed by a fast Walsh-Hadamard transform, an orthogonal and therefore
+  // lossless matrix, so the decay is set only by the per-line gains `10^(-3 * delay / decaySec)` (the RT60) and a
+  // one-pole lowpass per line for air absorption. Two Schroeder allpasses per channel diffuse the input first.
+  //
+  // Options:
+  // - decaySec (2): RT60
+  // - dampHz (5000)
+  // - preDelaySec (0.015)
+  // - size (1) scales the delay lines
+  // - mix (0.25): 1 returns only the reverb, which is what a send bus wants
+  // - width (1)
+  const FDN_LINES_MS = [31.3, 37.9, 41.1, 45.7, 49.3, 53.9, 59.1, 63.7]
+  const DIFFUSER_MS = [4.77, 3.59, 4.93, 3.71]
+  const ireverb = (f, opts = {}) => {
+    const sr = sampleRate
+    const decaySec = opts.decaySec ?? 2
+    const mix = opts.mix ?? 0.25
+    const width = opts.width ?? 1
+    const size = opts.size ?? 1
+    const damp = Math.exp((-TAU * (opts.dampHz ?? 5000)) / sr)
+    const diffuseGain = 0.6
+    const wetGain = 0.24
+
+    const lines = FDN_LINES_MS.map((ms) => new Float64Array(Math.round((ms * size * sr) / 1000)))
+    const lineGains = lines.map((line) => Math.pow(10, (-3 * line.length) / (decaySec * sr)))
+    const dampState = new Float64Array(8)
+    const diffusers = DIFFUSER_MS.map((ms) => new Float64Array(Math.round((ms * sr) / 1000)))
+    const preDelay = new Float64Array(Math.max(1, Math.round((opts.preDelaySec ?? 0.015) * sr)) * 2)
+    const x = new Float64Array(8)
+    const out = alloc()
+    let last = -1
+
+    const ring = (buf, n) => buf[n % buf.length]
+    const allpass = (buf, n, input) => {
+      const delayed = ring(buf, n)
+      const y = delayed - diffuseGain * input
+      buf[n % buf.length] = input + diffuseGain * y
+      return y
+    }
+    const reset = () => {
+      for (const buf of [...lines, ...diffusers, preDelay, dampState]) buf.fill(0)
+    }
+
+    const render = (n) => {
+      const [dl, dr] = f(n / sr)
+      const pi = (n % (preDelay.length / 2)) * 2
+      let inL = preDelay[pi]
+      let inR = preDelay[pi + 1]
+      preDelay[pi] = dl
+      preDelay[pi + 1] = dr
+      inL = allpass(diffusers[1], n, allpass(diffusers[0], n, inL))
+      inR = allpass(diffusers[3], n, allpass(diffusers[2], n, inR))
+
+      for (let i = 0; i < 8; i++) {
+        dampState[i] = ring(lines[i], n) + damp * (dampState[i] - ring(lines[i], n))
+        x[i] = dampState[i]
+      }
+      const wetL = x[0] - x[2] + x[4] - x[6]
+      const wetR = x[1] - x[3] + x[5] - x[7]
+
+      for (let h = 1; h < 8; h *= 2) {
+        for (let i = 0; i < 8; i += h * 2) {
+          for (let j = i; j < i + h; j++) {
+            const a = x[j]
+            x[j] = a + x[j + h]
+            x[j + h] = a - x[j + h]
+          }
+        }
+      }
+      for (let i = 0; i < 8; i++) {
+        lines[i][n % lines[i].length] = x[i] * Math.SQRT1_2 * 0.5 * lineGains[i] + (i % 2 === 0 ? inL : inR)
+      }
+
+      const mid = (wetL + wetR) * 0.5
+      const side = (wetL - wetR) * 0.5 * width
+      out[L] = dl * (1 - mix) + (mid + side) * wetGain * mix
+      out[R] = dr * (1 - mix) + (mid - side) * wetGain * mix
+    }
+
+    return (t) => {
+      const frame = Math.round(t * sr)
+      if (frame < 0) return f(t)
+      if (frame < last || frame > last + sr) {
+        reset()
+        last = frame - 1
+      }
+      while (last < frame) render(++last)
+      return out
+    }
+  }
+
+  // Synths
+  // ######
+  // Synths have always the form `f(hz, ...) -> t -> [l, r]`
+
+  // Pluck with a short ADSR env, slightly detuned in stereo.
+  const pluck = (hz, f, detuneCents = 3) => {
+    const env = adsr({ releaseTime: 0.05, attackSec: 0.005, decaySec: 0.08, sustain: 0.4, releaseSec: 0.18 })
+    return stereoDetuned(hz, f, detuneCents, env, 0.3)
+  }
+
+  // `f` in mid/side stereo, scaled by `env` and `gain`: mid is `f` itself, side is the difference of two copies
+  // detuned by ±`detuneCents`. The mono sum is exactly the mid, so it can never cancel, however the copies drift.
+  // Mid plus an uncorrelated side at half amplitude has 1.25x the power; this keeps the level of the mono voice.
+  const STEREO_NORM = 1 / Math.sqrt(1.25)
+  const stereoDetuned = (hz, f, detuneCents, env, gain) => {
+    const ratio = Math.pow(2, detuneCents / 1200)
+    const out = alloc()
+    return (t) => {
+      const hzNow = E(t, hz)
+      const g = env(t) * gain
+      const mid = f(t, hzNow)
+      const side = (f(t, hzNow * ratio) - f(t, hzNow / ratio)) * 0.5
+      out[L] = (mid + side) * g * STEREO_NORM
+      out[R] = (mid - side) * g * STEREO_NORM
+      return out
+    }
+  }
+
+  // Pad with a longer ADSR env, detuned in stereo.
+  const pad = (hz, f, detuneCents = 7) => {
+    const env = adsr({ releaseTime: 0.6, attackSec: 0.4, decaySec: 0.2, sustain: 0.7, releaseSec: 2.0 })
+    return stereoDetuned(hz, f, detuneCents, env, 0.25)
   }
 
   const iacid = (hz, opts = {}) => {
@@ -1012,22 +1310,447 @@ const Æ = (() => {
     }
   }
 
-  // fm2 is a simple 2-op fm.
+  const speechPhonemes = {
+    SP: { f: [500, 1500, 2500], bw: [100, 160, 220], amp: [0, 0, 0], voice: 0, noise: 0, dur: 0.08 },
+    AA: { f: [730, 1090, 2440], bw: [80, 90, 120], amp: [1, 0.58, 0.24], voice: 1, noise: 0.02, dur: 0.14 },
+    AE: { f: [660, 1720, 2410], bw: [80, 100, 120], amp: [1, 0.64, 0.28], voice: 1, noise: 0.02, dur: 0.13 },
+    AH: { f: [640, 1190, 2390], bw: [80, 100, 120], amp: [1, 0.5, 0.25], voice: 1, noise: 0.02, dur: 0.12 },
+    AO: { f: [570, 840, 2410], bw: [80, 90, 120], amp: [1, 0.46, 0.22], voice: 1, noise: 0.02, dur: 0.14 },
+    AW: { f: [620, 1180, 2550], bw: [90, 120, 150], amp: [1, 0.52, 0.24], voice: 1, noise: 0.02, dur: 0.15 },
+    EH: { f: [530, 1840, 2480], bw: [70, 90, 120], amp: [1, 0.66, 0.27], voice: 1, noise: 0.02, dur: 0.12 },
+    ER: { f: [490, 1350, 1690], bw: [70, 110, 120], amp: [1, 0.42, 0.36], voice: 1, noise: 0.02, dur: 0.14 },
+    EY: { f: [480, 2040, 2600], bw: [70, 100, 130], amp: [1, 0.62, 0.25], voice: 1, noise: 0.02, dur: 0.14 },
+    IH: { f: [390, 1990, 2550], bw: [60, 100, 120], amp: [1, 0.6, 0.25], voice: 1, noise: 0.02, dur: 0.11 },
+    IY: { f: [270, 2290, 3010], bw: [60, 100, 120], amp: [1, 0.62, 0.26], voice: 1, noise: 0.02, dur: 0.13 },
+    OW: { f: [570, 900, 2550], bw: [80, 100, 140], amp: [1, 0.48, 0.22], voice: 1, noise: 0.02, dur: 0.14 },
+    OY: { f: [500, 1550, 2600], bw: [80, 120, 150], amp: [1, 0.56, 0.24], voice: 1, noise: 0.02, dur: 0.15 },
+    UH: { f: [440, 1020, 2240], bw: [70, 100, 120], amp: [1, 0.45, 0.22], voice: 1, noise: 0.02, dur: 0.12 },
+    UW: { f: [300, 870, 2240], bw: [60, 90, 120], amp: [1, 0.45, 0.2], voice: 1, noise: 0.02, dur: 0.13 },
+    B: { f: [350, 1150, 2200], bw: [110, 190, 260], amp: [0.7, 0.28, 0.12], voice: 0.55, noise: 0.18, dur: 0.055 },
+    D: { f: [410, 1700, 2600], bw: [120, 220, 300], amp: [0.62, 0.36, 0.16], voice: 0.55, noise: 0.2, dur: 0.055 },
+    F: { f: [1300, 4500, 7200], bw: [500, 900, 1400], amp: [0.2, 0.65, 0.35], voice: 0.05, noise: 0.85, dur: 0.08 },
+    G: { f: [350, 1550, 2500], bw: [130, 240, 330], amp: [0.64, 0.32, 0.14], voice: 0.55, noise: 0.18, dur: 0.06 },
+    H: { f: [600, 1800, 3200], bw: [400, 900, 1500], amp: [0.35, 0.45, 0.25], voice: 0.15, noise: 0.65, dur: 0.07 },
+    K: { f: [450, 1900, 3300], bw: [140, 260, 420], amp: [0.52, 0.42, 0.2], voice: 0.08, noise: 0.7, dur: 0.065 },
+    L: { f: [340, 1100, 2600], bw: [80, 120, 180], amp: [0.78, 0.32, 0.18], voice: 0.9, noise: 0.04, dur: 0.08 },
+    M: { f: [250, 1200, 2100], bw: [70, 130, 220], amp: [0.7, 0.26, 0.1], voice: 0.85, noise: 0.03, dur: 0.08 },
+    N: { f: [280, 1700, 2600], bw: [70, 140, 240], amp: [0.68, 0.28, 0.12], voice: 0.85, noise: 0.03, dur: 0.075 },
+    NG: { f: [260, 2000, 2800], bw: [70, 160, 260], amp: [0.66, 0.24, 0.1], voice: 0.85, noise: 0.03, dur: 0.085 },
+    P: { f: [450, 1200, 2400], bw: [130, 220, 360], amp: [0.55, 0.3, 0.14], voice: 0.04, noise: 0.75, dur: 0.055 },
+    R: { f: [360, 1300, 1650], bw: [80, 120, 130], amp: [0.78, 0.28, 0.34], voice: 0.9, noise: 0.04, dur: 0.08 },
+    S: { f: [2600, 5200, 7800], bw: [600, 1000, 1500], amp: [0.22, 0.8, 0.5], voice: 0.03, noise: 1, dur: 0.085 },
+    SH: { f: [1800, 3400, 6200], bw: [500, 900, 1500], amp: [0.34, 0.78, 0.48], voice: 0.03, noise: 1, dur: 0.095 },
+    T: { f: [520, 2200, 4200], bw: [150, 320, 600], amp: [0.45, 0.5, 0.26], voice: 0.04, noise: 0.8, dur: 0.055 },
+    TH: { f: [1100, 3600, 6200], bw: [450, 900, 1500], amp: [0.24, 0.68, 0.36], voice: 0.04, noise: 0.85, dur: 0.08 },
+    V: { f: [1200, 4200, 7000], bw: [500, 900, 1400], amp: [0.2, 0.56, 0.3], voice: 0.45, noise: 0.62, dur: 0.08 },
+    W: { f: [300, 760, 2200], bw: [70, 100, 160], amp: [0.76, 0.36, 0.16], voice: 0.9, noise: 0.03, dur: 0.075 },
+    Y: { f: [280, 2250, 3000], bw: [60, 100, 130], amp: [0.72, 0.42, 0.18], voice: 0.9, noise: 0.03, dur: 0.075 },
+    Z: { f: [2400, 5000, 7600], bw: [600, 1000, 1500], amp: [0.2, 0.7, 0.42], voice: 0.45, noise: 0.7, dur: 0.085 },
+    ZH: { f: [1700, 3300, 5900], bw: [500, 900, 1500], amp: [0.3, 0.68, 0.42], voice: 0.45, noise: 0.68, dur: 0.09 },
+  }
+
+  const speechGraphemes = [
+    ["tion", ["SH", "AH", "N"]],
+    ["sion", ["ZH", "AH", "N"]],
+    ["ough", ["OW"]],
+    ["augh", ["AO"]],
+    ["eigh", ["EY"]],
+    ["th", ["TH"]],
+    ["sh", ["SH"]],
+    ["ch", ["T", "SH"]],
+    ["ng", ["NG"]],
+    ["ph", ["F"]],
+    ["ck", ["K"]],
+    ["wh", ["W"]],
+    ["qu", ["K", "W"]],
+    ["oo", ["UW"]],
+    ["ee", ["IY"]],
+    ["ea", ["IY"]],
+    ["ai", ["EY"]],
+    ["ay", ["EY"]],
+    ["oa", ["OW"]],
+    ["ow", ["AW"]],
+    ["ou", ["AW"]],
+    ["oi", ["OY"]],
+    ["oy", ["OY"]],
+    ["ar", ["AA", "R"]],
+    ["er", ["ER"]],
+    ["ir", ["ER"]],
+    ["or", ["AO", "R"]],
+    ["ur", ["ER"]],
+  ]
+
+  const speechLetters = {
+    a: ["AH"],
+    b: ["B"],
+    c: ["K"],
+    d: ["D"],
+    e: ["EH"],
+    f: ["F"],
+    g: ["G"],
+    h: ["H"],
+    i: ["IH"],
+    j: ["D", "ZH"],
+    k: ["K"],
+    l: ["L"],
+    m: ["M"],
+    n: ["N"],
+    o: ["OW"],
+    p: ["P"],
+    q: ["K"],
+    r: ["R"],
+    s: ["S"],
+    t: ["T"],
+    u: ["UH"],
+    v: ["V"],
+    w: ["W"],
+    x: ["K", "S"],
+    y: ["Y"],
+    z: ["Z"],
+  }
+
+  const addSpeechPhoneme = (segments, phoneme, durSec = undefined) => {
+    const key = String(phoneme).toUpperCase()
+    const ph = speechPhonemes[key] ?? speechPhonemes.SP
+    const prev = segments[segments.length - 1]
+    if (key === "SP" && prev?.phoneme === "SP") {
+      prev.durSec += durSec ?? ph.dur
+      return
+    }
+    segments.push({ phoneme: key, durSec: durSec ?? ph.dur })
+  }
+
+  const addSpeechToken = (segments, token, durSec = undefined) => {
+    const parts = String(token).trim().toUpperCase().split(/\s+/)
+    for (let i = 0; i < parts.length; i++) {
+      if (parts[i]) addSpeechPhoneme(segments, parts[i], durSec)
+    }
+  }
+
+  const textToSpeechSegments = (text) => {
+    const segments = []
+    const s = String(text).toLowerCase()
+    let i = 0
+    while (i < s.length) {
+      const c = s[i]
+      if (c === " " || c === "\n" || c === "\t" || c === "," || c === "." || c === "!" || c === "?") {
+        addSpeechPhoneme(segments, "SP", c === "," ? 0.14 : c === "." || c === "!" || c === "?" ? 0.2 : 0.08)
+        i++
+        continue
+      }
+      let matched = false
+      for (let j = 0; j < speechGraphemes.length; j++) {
+        const [grapheme, phonemes] = speechGraphemes[j]
+        if (s.startsWith(grapheme, i)) {
+          for (let k = 0; k < phonemes.length; k++) addSpeechPhoneme(segments, phonemes[k])
+          i += grapheme.length
+          matched = true
+          break
+        }
+      }
+      if (matched) continue
+      const phonemes = speechLetters[c]
+      if (phonemes) {
+        for (let j = 0; j < phonemes.length; j++) addSpeechPhoneme(segments, phonemes[j])
+      }
+      i++
+    }
+    return segments
+  }
+
+  const normalizeSpeechSegments = (textOrSegments, opts) => {
+    const raw = []
+    if (Array.isArray(textOrSegments)) {
+      for (let i = 0; i < textOrSegments.length; i++) {
+        const item = textOrSegments[i]
+        if (typeof item === "string") {
+          addSpeechToken(raw, item)
+        } else if (item && typeof item === "object") {
+          addSpeechToken(raw, item.phoneme ?? item.p ?? "SP", item.durSec ?? item.dur)
+        }
+      }
+    } else {
+      raw.push(...textToSpeechSegments(textOrSegments ?? ""))
+    }
+
+    const rate = Math.max(0.05, opts.rate ?? 1)
+    const scale = (opts.phonemeSec ?? 1) / rate
+    let startSec = 0
+    const segments = []
+    for (let i = 0; i < raw.length; i++) {
+      const key = raw[i].phoneme
+      const ph = speechPhonemes[key] ?? speechPhonemes.SP
+      const durSec = Math.max(0.005, raw[i].durSec * scale)
+      segments.push({ startSec, durSec, ph })
+      startSec += durSec
+    }
+    return { segments, durSec: startSec }
+  }
+
+  // Formant-based speech synthesizer.
   //
-  // Uses a sine modulator at `ratio * hz` for the carrier sine signal.
+  // `textOrSegments` may be a text string, an array of phoneme names, or segment objects:
+  // `{ phoneme: "AH", durSec: 0.12 }`.
+  //
+  // The returned function carries `.spectralEnvelope(t, bandsHz, gains)` which writes the vocal-tract gain at each
+  // of `bandsHz` into `gains` and returns the unvoiced (noise) share. `ivocoder` uses it in place of analysis.
+  const formantSpeech = (textOrSegments, opts = {}) => {
+    const { segments, durSec } = normalizeSpeechSegments(textOrSegments, opts)
+    const pitchHz = opts.pitchHz ?? 120
+    const gain = opts.gain ?? 0.75
+    const panPos = opts.pan ?? 0
+    const transitionSec = opts.transitionSec ?? 0.035
+    const maxHarmonics = opts.maxHarmonics ?? 48
+    const spectralTilt = opts.spectralTilt ?? 0.85
+    const out = alloc()
+
+    const formantGain = (hz, phA, phB, alpha, mouth) => {
+      let g = 0
+      for (let i = 0; i < 3; i++) {
+        const centerHz = lerp(phA.f[i], phB.f[i], alpha) * mouth
+        const bwHz = lerp(phA.bw[i], phB.bw[i], alpha)
+        const amp = lerp(phA.amp[i], phB.amp[i], alpha)
+        const x = (hz - centerHz) / bwHz
+        g += amp * Math.exp(-0.5 * x * x)
+      }
+      return g
+    }
+
+    // Aspiration and frication: noise shaped by the same three formants as the voiced part, like the parallel
+    // noise branch in Klatt, "Software for a cascade/parallel formant synthesizer" (JASA, 1980).
+    // Each formant is a `bandNoise` with a constant center per phoneme. Phonemes are crossfaded rather than their
+    // centers interpolated, since sweeping a ring-modulation carrier would chirp.
+    const formantNoise = (t, ph, mouth) => {
+      let s = 0
+      for (let i = 0; i < 3; i++) s += ph.amp[i] * bandNoise(t, ph.f[i] * mouth, ph.bw[i] * 1.5, i * 0.37)
+      return s
+    }
+
+    // The segment at `t`, its crossfade `alpha` into the next one, and the declick `gate`.
+    // Returns null outside of the utterance.
+    const frame = { idx: 0, seg: null, next: null, alpha: 0, gate: 0 }
+    const locate = (t) => {
+      if (t < 0 || t >= durSec || segments.length === 0) return null
+
+      let idx = 0
+      while (idx < segments.length - 1 && t >= segments[idx].startSec + segments[idx].durSec) idx++
+
+      const seg = segments[idx]
+      const localSec = t - seg.startSec
+      const fadeSec = Math.min(0.012, seg.durSec * 0.45)
+      frame.idx = idx
+      frame.seg = seg
+      frame.next = segments[idx + 1] ?? seg
+      frame.gate =
+        fadeSec <= 0 ? 1 : Math.min(1, Math.max(0, localSec / fadeSec), Math.max(0, (seg.durSec - localSec) / fadeSec))
+      frame.alpha =
+        transitionSec <= 0 || idx >= segments.length - 1
+          ? 0
+          : Math.max(0, Math.min(1, (localSec - (seg.durSec - transitionSec)) / transitionSec))
+      return frame
+    }
+
+    const fn = (t) => {
+      const located = locate(t)
+      if (located === null) {
+        out[L] = 0
+        out[R] = 0
+        return out
+      }
+      const { seg, next, alpha, gate } = located
+
+      const baseHz = Math.max(40, E(t, pitchHz))
+      const vibratoHz = E(t, opts.vibratoHz ?? 5.2)
+      const vibratoDepth = E(t, opts.vibratoDepth ?? 0.012)
+      const vibratoPhase =
+        vibratoHz === 0 ? 0 : (-baseHz * vibratoDepth * Math.cos(t * vibratoHz * TAU)) / (TAU * vibratoHz)
+      const phase = baseHz * t + vibratoPhase
+      const voicedHz = baseHz * (1 + vibratoDepth * sin(t, vibratoHz || 1))
+      const mouth = E(t, opts.mouth ?? 1)
+      const breath = E(t, opts.breath ?? 0.22)
+      const voice = lerp(seg.ph.voice, next.ph.voice, alpha)
+      const noiseAmt = lerp(seg.ph.noise, next.ph.noise, alpha)
+      const harmonicCount = Math.min(maxHarmonics, Math.floor((sampleRate * 0.45) / voicedHz))
+
+      let voiced = 0
+      let norm = 0
+      for (let k = 1; k <= harmonicCount; k++) {
+        const hz = voicedHz * k
+        const a = formantGain(hz, seg.ph, next.ph, alpha, mouth) / Math.pow(k, spectralTilt)
+        voiced += Math.sin(TAU * k * phase + k * 0.19) * a
+        norm += a
+      }
+      if (norm > 0) voiced /= norm
+
+      const hissAmt = noiseAmt * breath
+      let hiss = 0
+      if (hissAmt > 0) {
+        hiss = formantNoise(t, seg.ph, mouth)
+        if (alpha > 0) hiss = lerp(hiss, formantNoise(t, next.ph, mouth), alpha)
+      }
+      const s = (voiced * voice + hiss * hissAmt * 2) * gate * gain
+      const p = Math.max(-1, Math.min(1, E(t, panPos)))
+      const angle = (p + 1) * Math.PI * 0.25
+      out[L] = s * Math.cos(angle)
+      out[R] = s * Math.sin(angle)
+      return out
+    }
+    fn.spectralEnvelope = (t, bandsHz, gains) => {
+      const located = locate(t)
+      if (located === null) {
+        gains.fill(0)
+        return 0
+      }
+      const { seg, next, alpha, gate } = located
+      const mouth = E(t, opts.mouth ?? 1)
+      const voice = lerp(seg.ph.voice, next.ph.voice, alpha)
+      const noiseAmt = lerp(seg.ph.noise, next.ph.noise, alpha)
+      // Fricatives sit well below vowels in natural speech; matches the `hissAmt` level of the synth itself.
+      const level = Math.max(voice, noiseAmt * 0.4) * gate * gain
+      for (let i = 0; i < bandsHz.length; i++) gains[i] = formantGain(bandsHz[i], seg.ph, next.ph, alpha, mouth) * level
+      return noiseAmt * gate
+    }
+    fn.dur = durSec
+    return fn
+  }
+
+  // Impure virtual-analog voice, the subtractive synth of a modern soft synth.
+  //
+  // - `voices` unison PolyBLEP oscillators detuned across ±`detuneCents`, panned across `spread`, with fixed phase
+  //   offsets so they never start aligned. An optional square sub one octave down and noise.
+  // - `tanh` drive into a resonant zero-delay-feedback lowpass (see `svfStep`) whose cutoff follows its own ADSR
+  //   by `envOct` octaves and the pitch by `keyTrack` (1 tracks fully, relative to C4).
+  // - Exponential amp and filter ADSRs; the release starts at `gateSec`.
+  //
+  // Options (numbers may be functions of t except voices, detuneCents, spread and gateSec):
+  // - wave: "saw" | "square" | (t, hz) => number  ("saw")
+  // - voices (3), detuneCents (12), spread (0.7)
+  // - sub (0), noise (0)
+  // - cutoffHz (900), q (1), envOct (3), keyTrack (0.5)
+  // - drive (1.5)
+  // - gateSec (Infinity)
+  // - amp: { attackSec (0.003), decaySec (0.3), sustain (0.7), releaseSec (0.2) }
+  // - filter: { attackSec (0.001), decaySec (0.25), sustain (0.2), releaseSec (0.3) }
+  // - gain (1)
+  const isynth = (hz, opts = {}) => {
+    const sr = sampleRate
+    const osc = typeof opts.wave === "function" ? opts.wave : opts.wave === "square" ? square : saw
+    const voices = opts.voices ?? 3
+    const detuneCents = opts.detuneCents ?? 12
+    const spread = opts.spread ?? 0.7
+    const gateSec = opts.gateSec ?? Infinity
+    const ampEnv = adsr({
+      attackSec: 0.003,
+      decaySec: 0.3,
+      sustain: 0.7,
+      releaseSec: 0.2,
+      ...opts.amp,
+      releaseTime: gateSec,
+    })
+    const filterEnv = adsr({
+      attackSec: 0.001,
+      decaySec: 0.25,
+      sustain: 0.2,
+      releaseSec: 0.3,
+      ...opts.filter,
+      releaseTime: gateSec,
+    })
+
+    const ratios = new Float64Array(voices)
+    const phases = new Float64Array(voices)
+    const gainsL = new Float64Array(voices)
+    const gainsR = new Float64Array(voices)
+    for (let i = 0; i < voices; i++) {
+      const x = voices === 1 ? 0 : (2 * i) / (voices - 1) - 1
+      const angle = (spread * x + 1) * Math.PI * 0.25
+      ratios[i] = Math.pow(2, (x * detuneCents) / 1200)
+      // Golden-ratio phase offsets are as far from each other as possible.
+      phases[i] = (i * 0.618034) % 1
+      gainsL[i] = (Math.cos(angle) * Math.SQRT2) / Math.sqrt(voices)
+      gainsR[i] = (Math.sin(angle) * Math.SQRT2) / Math.sqrt(voices)
+    }
+
+    const state = new Float64Array(4)
+    const out = alloc()
+    let last = -1
+
+    const render = (n) => {
+      const t = n / sr
+      const f0 = E(t, hz)
+      let l = 0,
+        r = 0
+      for (let i = 0; i < voices; i++) {
+        const s = osc(t + phases[i] / f0, f0 * ratios[i])
+        l += s * gainsL[i]
+        r += s * gainsR[i]
+      }
+      const sub = E(t, opts.sub ?? 0) * square(t, f0 * 0.5)
+      const hiss = E(t, opts.noise ?? 0)
+      const drive = E(t, opts.drive ?? 1.5)
+      const driveNorm = 1 / Math.tanh(drive)
+      const xl = Math.tanh(drive * (l + sub + hiss * noise(n))) * driveNorm
+      const xr = Math.tanh(drive * (r + sub + hiss * noise(n + 0.5))) * driveNorm
+
+      const cutoffHz =
+        E(t, opts.cutoffHz ?? 900) *
+        Math.pow(2, E(t, opts.envOct ?? 3) * filterEnv(t)) *
+        Math.pow(f0 / 261.63, E(t, opts.keyTrack ?? 0.5))
+      const g = svfCoef(cutoffHz)
+      const k = 1 / E(t, opts.q ?? 1)
+      const amp = ampEnv(t) * E(t, opts.gain ?? 1) * 0.25
+      out[L] = svfStep(state, 0, xl, g, k)[0] * amp
+      out[R] = svfStep(state, 2, xr, g, k)[0] * amp
+    }
+
+    return (t) => {
+      const frame = Math.round(t * sr)
+      if (frame < last || frame > last + sr) {
+        state.fill(0)
+        last = frame - 1
+      }
+      while (last < frame) render(++last)
+      return out
+    }
+  }
+
+  // fm2 is a 2-op FM voice in the style of the DX7 (Chowning, "The Synthesis of Complex Audio Spectra by Means of
+  // Frequency Modulation", 1973).
+  //
+  // - A sine modulator at `ratio * hz` drives the carrier sine. Its index decays from `modIndex` to
+  //   `modSustain * modIndex` over `modDecaySec`.
+  // - `keyScale` lowers the index above 220Hz like DX7 keyboard level scaling, so high notes do not turn harsh.
+  // - `feedback` self-modulates the modulator, which adds saw-like harmonics. The feedback loop is solved by two
+  //   fixed-point iterations, which keeps the voice pure and is close to the DX7's one-sample feedback.
+  // - Mid/side stereo like `pad`: mid is the voice, side the difference of two copies detuned by ±`detuneCents`.
   const fm2 = (hz, opts = {}) => {
     const env = opts.env ?? adsr({ releaseTime: 0.1, attackSec: 0.005, decaySec: 0.15, sustain: 0.5, releaseSec: 0.3 })
+    const detuneRatio = Math.pow(2, (opts.detuneCents ?? 4) / 1200)
+    const keyScale = opts.keyScale ?? 0.5
     const out = alloc()
+    const operator = (t, hz, ratio, index, feedback) => {
+      const modPhase = t * hz * ratio * TAU
+      let m = Math.sin(modPhase)
+      m = Math.sin(modPhase + feedback * m)
+      m = Math.sin(modPhase + feedback * m)
+      return Math.sin(t * hz * TAU + index * m)
+    }
     return (t) => {
       const hzNow = E(t, hz)
       const ratio = E(t, opts.ratio ?? 2)
       const modIndex = E(t, opts.modIndex ?? 4)
       const modDecaySec = E(t, opts.modDecaySec ?? 0.3)
-      const modAmp = modIndex * Math.exp(-t / modDecaySec)
-      const modSig = Math.sin(t * hzNow * ratio * TAU) * modAmp
-      const s = Math.sin(t * hzNow * TAU + modSig) * env(t) * 0.3
-      out[L] = s
-      out[R] = s
+      const modSustain = E(t, opts.modSustain ?? 0.08)
+      const feedback = E(t, opts.feedback ?? 0.2)
+      const indexEnv = modSustain + (1 - modSustain) * Math.exp(-t / modDecaySec)
+      const index = modIndex * indexEnv * Math.min(1, Math.pow(220 / hzNow, keyScale))
+      const g = env(t) * 0.3
+      const mid = operator(t, hzNow, ratio, index, feedback)
+      const side =
+        (operator(t, hzNow * detuneRatio, ratio, index, feedback) -
+          operator(t, hzNow / detuneRatio, ratio, index, feedback)) *
+        0.5
+      out[L] = (mid + side) * g * STEREO_NORM
+      out[R] = (mid - side) * g * STEREO_NORM
       return out
     }
   }
@@ -1038,17 +1761,24 @@ const Æ = (() => {
 
   // Synthetic kick drum.
   //
-  // Sine + triangle blend with a fast exponential pitch sweep from `6*tuneHz` to `tuneHz`.
+  // Sine with a fast exponential pitch sweep from `6*tuneHz` to `tuneHz`.
   // The sweep is integrated analytically so phase stays continuous:
   //   hz(t) = tune + sweep * exp(-t / pitchDecaySec)
   //   phase(t) = tune*t + sweep * pitchDecaySec * (1 - exp(-t/pitchDecaySec))
+  //
+  // The amplitude follows the gamma-shaped `(1 + x) * exp(-x)` which has zero slope at the hit, so the body holds
+  // before it decays. `tanh` saturation adds the upper harmonics that keep the kick audible on small speakers and
+  // a short band-limited noise burst provides the beater click.
   const kick = (opts = {}) => {
     const attackSec = opts.attackSec ?? 0.002
     const decaySec = opts.decaySec ?? 0.3
     const tuneHz = opts.tuneHz ?? 50
     const pitchDecaySec = opts.pitchDecaySec ?? 0.05
-    const startHz = tuneHz * 6
-    const sweep = startHz - tuneHz
+    const drive = opts.drive ?? 1.8
+    const click = opts.click ?? 0.5
+    const sweepHz = tuneHz * 5
+    const bodySec = decaySec * 0.6
+    const driveNorm = 1 / Math.tanh(drive)
     const out = alloc()
     return (t) => {
       if (t <= 0) {
@@ -1057,11 +1787,13 @@ const Æ = (() => {
         return out
       }
       const pitchEnv = Math.exp(-t / pitchDecaySec)
-      const phase = tuneHz * t + sweep * pitchDecaySec * (1 - pitchEnv)
-      const amp = t < attackSec ? t / attackSec : Math.exp(-(t - attackSec) / decaySec)
-      const p = phase - Math.floor(phase)
-      const triCentered = 1 - 2 * Math.abs(2 * p - 1) // tri in [-1, 1]
-      const s = (Math.sin(phase * TAU) * 0.7 + triCentered * 0.3) * amp * 0.55
+      const phase = tuneHz * t + sweepHz * pitchDecaySec * (1 - pitchEnv)
+      const x = t / bodySec
+      const hit = t < attackSec ? t / attackSec : 1
+      const amp = hit * (1 + x) * Math.exp(-x)
+      const body = Math.tanh(drive * amp * Math.sin(phase * TAU)) * driveNorm
+      const beater = bandNoise(t, 3200, 2400, 0.71) * Math.exp(-t / 0.003) * click
+      const s = (body + beater) * 0.33
       out[L] = s
       out[R] = s
       return out
@@ -1070,7 +1802,11 @@ const Æ = (() => {
 
   // Synthetic snare.
   //
-  // Tuned shell body, band-shaped noise, and a short broadband crack.
+  // Follows Gordon Reid, "Synth Secrets: Practical Snare Drum Synthesis" (Sound On Sound, 2002):
+  // - Two drum-head modes at the 1 : 1.59 ratio of the (0,1) and (1,1) circular-membrane modes. The pitch drop
+  //   is integrated analytically like in `kick`.
+  // - Snare wires as two bands of noise (0.5-6.5kHz and 5-13kHz).
+  // - A short, differentiated noise crack for the stick.
   const snare = (opts = {}) => {
     const attackSec = opts.attackSec ?? 0.001
     const decaySec = opts.decaySec ?? 0.18
@@ -1078,8 +1814,8 @@ const Æ = (() => {
     const noiseAmt = opts.noiseAmt ?? 0.7
     const snap = opts.snap ?? 0.35
     const tonalAmt = 1 - noiseAmt
-    const ringHz = tuneHz * 1.62
-    const lowRingHz = tuneHz * 0.53
+    const dropSec = 0.02
+    const dropHz = tuneHz * 0.4
     const out = alloc()
     return (t) => {
       if (t <= 0) {
@@ -1089,37 +1825,32 @@ const Æ = (() => {
       }
       const frame = Math.floor(t * sampleRate)
       const hit = t < attackSec ? t / attackSec : 1
-      const bodyEnv = hit * Math.exp(-t / (decaySec * 0.72))
-      const noiseEnv = hit * Math.exp(-t / decaySec)
-      const crackEnv = hit * Math.exp(-t / 0.012)
-      const rattleEnv = hit * Math.exp(-t / (decaySec * 1.45))
+      const bodyEnv = hit * Math.exp(-t / (decaySec * 0.5))
+      const wireEnv = hit * Math.exp(-t / decaySec)
+      const rattleEnv = hit * Math.exp(-t / (decaySec * 1.6))
+      const crackEnv = hit * Math.exp(-t / 0.005)
 
-      const pitchDrop = 1 + 0.35 * Math.exp(-t / 0.026)
-      const body =
-        (sin(t, tuneHz * pitchDrop) * 0.62 + sin(t, ringHz) * 0.24 + tri(t, lowRingHz) * 0.14) * tonalAmt * bodyEnv
+      const headPhase = tuneHz * t + dropHz * dropSec * (1 - Math.exp(-t / dropSec))
+      const head = Math.sin(headPhase * TAU) * 0.75 + Math.sin(headPhase * 1.59 * TAU) * 0.35
+      const body = Math.tanh(1.5 * head) * tonalAmt * bodyEnv
 
-      const whiteL = noise(frame + 17)
-      const whiteR = noise(frame + 113)
-      const brightL = whiteL - 0.72 * noise(frame - 5) + 0.34 * noise(frame - 23) - 0.12 * noise(frame - 71)
-      const brightR = whiteR - 0.72 * noise(frame - 7) + 0.34 * noise(frame - 31) - 0.12 * noise(frame - 89)
-      const midL = noise(frame + 211) - 0.52 * noise(frame - 97) + 0.2 * noise(frame - 251)
-      const midR = noise(frame + 313) - 0.52 * noise(frame - 131) + 0.2 * noise(frame - 337)
-      const bandL = brightL * 0.52 + midL * 0.34
-      const bandR = brightR * 0.52 + midR * 0.34
-      const crackL = (whiteL - noise(frame - 1)) * crackEnv
-      const crackR = (whiteR - noise(frame - 3)) * crackEnv
-      const tailL = (noise(frame + 503) - noise(frame - 377)) * rattleEnv * 0.16
-      const tailR = (noise(frame + 709) - noise(frame - 419)) * rattleEnv * 0.16
+      const wiresL = bandNoise(t, 3500, 3000, 0.13) * wireEnv + bandNoise(t, 9000, 4000, 0.37) * rattleEnv * 0.6
+      const wiresR = bandNoise(t, 3500, 3000, 0.53) * wireEnv + bandNoise(t, 9000, 4000, 0.79) * rattleEnv * 0.6
+      const crackL = (noise(frame) - noise(frame - 1)) * crackEnv * snap
+      const crackR = (noise(frame + 0.5) - noise(frame - 0.5)) * crackEnv * snap
 
-      out[L] = (body + bandL * noiseAmt * noiseEnv + crackL * snap * 0.72 + tailL * noiseAmt) * 0.31
-      out[R] = (body * 0.96 + bandR * noiseAmt * noiseEnv + crackR * snap * 0.72 + tailR * noiseAmt) * 0.31
+      out[L] = (body + wiresL * noiseAmt * 1.4 + crackL * 0.5) * 0.27
+      out[R] = (body + wiresR * noiseAmt * 1.4 + crackR * 0.5) * 0.27
       return out
     }
   }
 
-  // Synthetic Hihat.
+  // Synthetic hihat.
   //
-  // Inharmonic metal partials plus high-passed noise and a thin air layer.
+  // Metal: two FM pairs with irrational frequency ratios produce a dense inharmonic spectrum around `shimmerHz`
+  // (Chowning, "The Synthesis of Complex Audio Spectra by Means of Frequency Modulation", 1973). The modulation
+  // index decays with the hit, so the hat darkens as it rings out.
+  // Noise: a second difference `n[k] - 2n[k-1] + n[k-2]` is a 12dB/oct highpass on white noise, plus an air band.
   // `open: true` switches to a long decay for the open variant; closed is a tight tick.
   const hihat = (opts = {}) => {
     const open = opts.open ?? false
@@ -1129,6 +1860,13 @@ const Æ = (() => {
     const tone = opts.tone ?? 0.18
     const chokeSec = open ? decaySec * 0.55 : decaySec * 0.42
     const out = alloc()
+    const metal = (t, env) => {
+      const index = 1 + 2.5 * env
+      const a = Math.sin(TAU * shimmerHz * t + index * sin(t, shimmerHz * Math.SQRT2))
+      const b = Math.sin(TAU * shimmerHz * 0.7231 * t + index * sin(t, shimmerHz * 1.6619))
+      return (a + b) * 0.5
+    }
+    const highpass = (frame) => (noise(frame) - 2 * noise(frame - 1) + noise(frame - 2)) * 0.5
     return (t) => {
       if (t <= 0) {
         out[L] = 0
@@ -1139,28 +1877,17 @@ const Æ = (() => {
       const hit = t < attackSec ? t / attackSec : 1
       const bodyEnv = hit * Math.exp(-t / chokeSec)
       const airEnv = hit * Math.exp(-t / decaySec)
-      const tickEnv = hit * Math.exp(-t / 0.006)
+      const tickEnv = hit * Math.exp(-t / 0.004)
 
-      const n0 = noise(frame + 31)
-      const n1 = noise(frame - 5)
-      const n2 = noise(frame - 19)
-      const n3 = noise(frame - 83)
-      const n4 = noise(frame + 167)
-      const hpL = n0 - 0.78 * n1 + 0.42 * n2 - 0.18 * n3
-      const hpR = noise(frame + 97) - 0.78 * noise(frame - 37) + 0.42 * noise(frame - 61) - 0.18 * noise(frame - 131)
-      const airL = (n4 - noise(frame - 233)) * 0.32
-      const airR = (noise(frame + 269) - noise(frame - 307)) * 0.32
-      const metal =
-        square(t, shimmerHz * 0.49) * 0.18 +
-        square(t, shimmerHz * 0.73) * 0.2 +
-        square(t, shimmerHz * 1.0) * 0.24 +
-        square(t, shimmerHz * 1.342) * 0.2 +
-        square(t, shimmerHz * 1.731) * 0.18
-      const stick = (n0 - noise(frame - 1)) * tickEnv * 0.42
-      const body = (hpL * (1 - tone) + metal * tone) * bodyEnv
-      const bodyR = (hpR * (1 - tone) + metal * 0.92 * tone) * bodyEnv
-      out[L] = (body + airL * airEnv + stick) * 0.13
-      out[R] = (bodyR + airR * airEnv - stick * 0.18) * 0.13
+      const m = metal(t, bodyEnv) * tone * 1.6
+      const hpL = highpass(frame)
+      const hpR = highpass(frame + 0.5)
+      const airL = bandNoise(t, 11000, 4000, 0.29)
+      const airR = bandNoise(t, 11000, 4000, 0.61)
+      const stick = hpL * tickEnv * 0.5
+
+      out[L] = ((hpL * (1 - tone) + m) * bodyEnv + airL * airEnv * 0.5 + stick) * 0.15
+      out[R] = ((hpR * (1 - tone) + m * 0.92) * bodyEnv + airR * airEnv * 0.5 + stick * 0.5) * 0.15
       return out
     }
   }
@@ -1176,6 +1903,8 @@ const Æ = (() => {
     bell,
     stepSin,
     noise,
+    valueNoise,
+    bandNoise,
 
     // utils
     alloc,
@@ -1232,12 +1961,18 @@ const Æ = (() => {
     iphaser,
     distort,
     icomp,
+    ivocoder,
+    isvf,
+    ireverb,
 
     // synths
     pluck,
     pad,
     iacid,
+    isynth,
     ikarplus,
+    speechPhonemes,
+    formantSpeech,
     fm2,
 
     // drums
