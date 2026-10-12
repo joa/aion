@@ -233,6 +233,7 @@ const tempo = Æ.tempoLfo(Æ.tempoBpm(120), 2, 0.5)
 | `Æ.timeReverse` | `(f: (t: number) -> Pair, startSec: number, endSec: number) -> (t: number) -> Pair` | ✓    | Mirror time in `[startSec, endSec)`. | `Æ.timeReverse(f, 0, 4)` |
 | `Æ.timeRepeat`  | `(f: (t: number) -> Pair, durationSec: number) -> (t: number) -> Pair`              | ✓    | Loop `f` every `durationSec`.        | `Æ.timeRepeat(f, 2)`     |
 | `Æ.ibuf`        | `(f: (t: number) -> Pair, capacitySec: number = 1) -> (t: number) -> Pair`          | ✗    | Internal ring-buffer.                | `const b = Æ.ibuf(f)`    |
+| `Æ.bake`        | `(f: (t: number) -> Pair, durSec: number) -> (t: number) -> Pair`                   | ✓    | Pre-rendered sample of `f`.          | `Æ.bake(Æ.kick(), 0.5)`  |
 
 #### Buffering
 
@@ -256,6 +257,17 @@ const out = Æ.alloc()                      // pre-allocate sample pair (optiona
   return out
 }
 ```
+
+#### Baking
+
+`Æ.bake(f, durSec)` renders `f` over `[0, durSec)` into a table once, at construction, and plays it back with linear interpolation; it is silent outside that range. An expensive voice becomes a lookup, and an impure one becomes pure, so the sample may be shifted, reversed or pitched by scaling `t`.
+
+```js
+const snare = Æ.bake(Æ.sum(Æ.snare(), Æ.clap()), 0.5) // layered once, played as a sample
+const higher = (t) => snare(t * 1.5)                  // a fifth up and shorter
+```
+
+Construction evaluates `f` `durSec * sampleRate` times while the code compiles, which blocks the worklet, so keep baked sounds short.
 
 ### Sequencers
 
@@ -282,6 +294,7 @@ const out = Æ.alloc()                      // pre-allocate sample pair (optiona
 | `Æ.ikarplus`       | `(hz: Env \| number, opts: KarplusOptions) -> (t: number) -> Pair`                     | ✗    | Karplus-Strong guitar.        | `Æ.ikarplus(110)`               |
 | `Æ.formantSpeech`  | `(text: string \| SpeechSegment[], opts: FormantSpeechOptions) -> (t: number) -> Pair` | ✓    | Formant speech synthesizer.   | `Æ.formantSpeech("hello aion")` |
 | `Æ.speechPhonemes` | `{ [name: string]: SpeechPhoneme }`                                                    | ✓    | Built-in formant phoneme map. | `Æ.speechPhonemes.AH`           |
+| `Æ.sing`           | `(notes: SungNote[], opts: SingOptions) -> (t: number) -> Pair`                        | ✓    | Formant singing voice.        | `Æ.sing([[0, 1, "A3", "L AA"]])` |
 | `Æ.fm2`            | `(hz: Env \| number, opts: Fm2Options) -> (t: number) -> Pair`                         | ✓    | DX7-style 2-operator FM.      | `Æ.fm2(440, { modIndex: 8 })`   |
 
 #### AcidOptions
@@ -371,6 +384,40 @@ Unison oscillators into drive and a resonant lowpass with its own envelope. Numb
 
 Built-in phonemes: `SP`, `AA`, `AE`, `AH`, `AO`, `AW`, `EH`, `ER`, `EY`, `IH`, `IY`, `OW`, `OY`, `UH`, `UW`, `B`, `D`, `F`, `G`, `H`, `K`, `L`, `M`, `N`, `NG`, `P`, `R`, `S`, `SH`, `T`, `TH`, `V`, `W`, `Y`, `Z`, `ZH`.
 
+#### Singing
+
+`Æ.formantSpeech` speaks; `Æ.sing` sings melodies. Its score is a list of `SungNote`, `[startSec, durSec, note, syllable]`, where `note` is a note name or Hz and `syllable` lists phonemes of `Æ.speechPhonemes` separated by spaces. The first vowel lands on `startSec`; consonants before it are sung ahead of `startSec`, consonants after it close the syllable, and a second vowel makes a diphthong. A syllable is held until the next one starts, so lines are legato unless the score leaves a rest.
+
+```js
+const beatSec = 60 / 120
+const hook = [
+  [0, 1, "C4", "T EY K"], // take
+  [1, 1, "D4", "M IY"], //   me
+  [2, 2, "G4", "H AA IY"], // hi-
+  [4, 2, "E4", "ER"], //     -gher
+]
+Æ.sing(hook.map(([beat, beats, note, syllable]) => [beat * beatSec, beats * beatSec, note, syllable]))
+```
+
+Pitch glides between notes with a continuous phase, vowels come from cascade formant synthesis, and plosives close and burst. The voice is pure and carries `.dur`.
+
+#### SingOptions
+
+```js
+{
+  glideSec:        number       = 0.07
+  transitionSec:   number       = 0.05   // crossfade between phonemes
+  consonantSec:    number       = 0.055
+  vibratoHz:       number       = 5.4
+  vibratoDepth:    number       = 0.012  // fades in on held notes
+  vibratoDelaySec: number       = 0.25
+  breath:          number       = 0.03
+  maxHarmonics:    number       = 48
+  gain:            number       = 0.35
+  pan:             Env | number = 0
+}
+```
+
 ### Drums
 
 | Symbol    | Type                                         | Pure | Description           | Example                   |
@@ -378,6 +425,7 @@ Built-in phonemes: `SP`, `AA`, `AE`, `AH`, `AO`, `AW`, `EH`, `ER`, `EY`, `IH`, `
 | `Æ.kick`  | `(opts: KickOptions) -> (t: number) -> Pair` | ✓    | Synthetic kick drum.  | `Æ.kick({ tuneHz: 40 })`  |
 | `Æ.snare` | `(opts: SnareOptions) -> (t: number) -> Pair` | ✓    | Synthetic snare drum. | `Æ.snare()`               |
 | `Æ.hihat` | `(opts: HihatOptions) -> (t: number) -> Pair` | ✓    | Synthetic hi-hat.     | `Æ.hihat({ open: true })` |
+| `Æ.clap`  | `(opts: ClapOptions) -> (t: number) -> Pair`  | ✓    | Synthetic hand clap.  | `Æ.clap({ bursts: 4 })`   |
 
 #### KickOptions
 ```js
@@ -413,6 +461,16 @@ Built-in phonemes: `SP`, `AA`, `AE`, `AH`, `AO`, `AW`, `EH`, `ER`, `EY`, `IH`, `
 }
 ```
 
+#### ClapOptions
+```js
+{
+  decaySec:  number = 0.16   // room tail
+  toneHz:    number = 1200
+  spreadSec: number = 0.009  // time between the hands
+  bursts:    number = 3
+}
+```
+
 
 ### Effects
 
@@ -426,6 +484,8 @@ Built-in phonemes: `SP`, `AA`, `AE`, `AH`, `AO`, `AW`, `EH`, `ER`, `EY`, `IH`, `
 | `Æ.iphaser`  | `(f: (t: number) -> Pair, rateHz: number = 0.5, depth: number = 1, stages: number = 4, n: number = 256) -> (t: number) -> Pair`                 | ✗    | Phaser effect.                    | `Æ.iphaser(f)`              |
 | `Æ.distort`  | `(f: (t: number) -> Pair, drive: number = 3, kind: "soft" \| "hard" = "soft") -> (t: number) -> Pair`                                           | ✓    | Soft/Hard clipping.               | `Æ.distort(f, 5, "hard")`   |
 | `Æ.icomp`    | `(f: (t: number) -> Pair, opts: CompressorOptions) -> (t: number) -> Pair`                                                           | ✗    | Soft-knee compressor.             | `Æ.icomp(f, { ratio: 4 })`  |
+| `Æ.ilimit`   | `(f: (t: number) -> Pair, opts: LimiterOptions) -> (t: number) -> Pair`                                                              | ✗    | Lookahead peak limiter.           | `Æ.ilimit(f, { gainDb: 3 })` |
+| `Æ.ipingpong` | `(f: (t: number) -> Pair, stepSec: number, feedback: number = 0.5, opts: PingPongOptions) -> (t: number) -> Pair`                   | ✗    | Stereo ping-pong delay.           | `Æ.ipingpong(f, 0.28, 0.4)` |
 | `Æ.isvf`     | `(f: (t: number) -> Pair, cutoffHz: Env \| number = 1000, q: Env \| number = 0.707, mode: "lp" \| "bp" \| "hp" = "lp") -> (t: number) -> Pair` | ✗ | Sweepable resonant filter. | `Æ.isvf(f, (t) => 200 + 2000 * t)` |
 | `Æ.ireverb`  | `(f: (t: number) -> Pair, opts: ReverbOptions) -> (t: number) -> Pair` | ✗ | FDN reverb. | `Æ.ireverb(f, { decaySec: 3 })` |
 | `Æ.ivocoder` | `(carrier: (t: number) -> Pair, modulator: (t: number) -> Pair, opts: VocoderOptions) -> (t: number) -> Pair`                        | ✗    | Channel vocoder.                  | `Æ.ivocoder(synth, voice)`  |
@@ -441,6 +501,26 @@ Built-in phonemes: `SP`, `AA`, `AE`, `AH`, `AO`, `AW`, `EH`, `ER`, `EY`, `IH`, `
   makeupDb:    number              = 0
   sidechain:   (t: number) -> Pair = f
   capacitySec: number              = 0.5
+}
+```
+
+#### LimiterOptions
+```js
+{
+  gainDb:       number = 0      // drive into the limiter
+  ceilingDb:    number = -1     // the output never exceeds this
+  lookaheadSec: number = 0.005  // also the latency
+  releaseSec:   number = 0.1
+}
+```
+
+`Æ.ilimit` is the last stage of a master bus. The gain each sample needs is min-held over the lookahead window and then averaged, so the gain is already down when a peak arrives and the ceiling holds without clipping.
+
+#### PingPongOptions
+```js
+{
+  dampHz: number = 3500  // each repeat is darker than the last
+  mix:    number = 0.35  // 1 = echoes only, for a send bus
 }
 ```
 
@@ -485,4 +565,4 @@ See `examples/vocoder.js`.
 
 ---
 
-¹: The optional standard lib clocks in with another 1k LoC
+¹: The optional standard lib clocks in with another 2.4k LoC

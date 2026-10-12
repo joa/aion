@@ -20,7 +20,7 @@ const startBtn = document.getElementById("start")
 const stopBtn = document.getElementById("stop")
 const applyBtn = document.getElementById("apply")
 
-const DEFAULT_EXAMPLE = "machine_heart.js"
+const DEFAULT_EXAMPLE = "higher_opus_5_5_max.js"
 
 const examples = Object.entries(exampleModules)
   .map(([path, code]) => ({

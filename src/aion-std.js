@@ -270,8 +270,8 @@ const Æ = (() => {
   //   - `pitch("g#3")`is the same as `pitch("G#3")`
   //   - `pitch(440)` is the same as `pitch("A4")`
   const pitch = (note) => {
-    if (typeof name === "number") {
-      return name
+    if (typeof note === "number") {
+      return note
     }
     const m = note.match(/^([A-Ga-g])([#b]?)-?(\d+)$/)
     if (!m) throw new Error(`bad note: ${note}`)
@@ -537,6 +537,40 @@ const Æ = (() => {
     fn.buf = buf
     fn.cap = cap
 
+    return fn
+  }
+
+  // Pure sampler: renders `f` over [0, durSec) into a table once, at construction, and plays it back with linear
+  // interpolation; silent outside. Like bouncing a track in a DAW, an expensive voice becomes a lookup and an impure
+  // one becomes pure, so it may be shifted, reversed (`timeReverse`) or pitched by scaling `t`.
+  //
+  // Construction costs `durSec * sampleRate` evaluations of `f`, so keep baked sounds short.
+  const bake = (f, durSec) => {
+    const sr = sampleRate
+    const n = Math.max(1, Math.ceil(durSec * sr))
+    // One silent guard frame at the end, so the last frame interpolates towards zero.
+    const table = new Float32Array((n + 1) * 2)
+    for (let i = 0; i < n; i++) {
+      const [l, r] = f(i / sr)
+      table[i * 2] = l
+      table[i * 2 + 1] = r
+    }
+    const out = alloc()
+    const fn = (t) => {
+      const frame = t * sr
+      if (!(frame >= 0 && frame < n)) {
+        out[L] = 0
+        out[R] = 0
+        return out
+      }
+      const i = Math.floor(frame)
+      const alpha = frame - i
+      const j = i * 2
+      out[L] = table[j] + (table[j + 2] - table[j]) * alpha
+      out[R] = table[j + 1] + (table[j + 3] - table[j + 1]) * alpha
+      return out
+    }
+    fn.dur = durSec
     return fn
   }
 
@@ -936,6 +970,137 @@ const Æ = (() => {
       const i = wrap(frame, cap) * 2
       out[L] = buf[i]
       out[R] = buf[i + 1]
+      return out
+    }
+  }
+
+  // Impure lookahead peak limiter, the last stage of a master bus.
+  //
+  // For every sample we compute the gain that keeps it under `ceilingDb`, hold the minimum of that gain over the
+  // lookahead window with a monotonic wedge (Lemire, "Streaming Maximum-Minimum Filter Using No More than Three
+  // Comparisons per Element", 2006) and average it with a boxcar of the same length. Every boxcar tap has already
+  // seen the upcoming peak, so the gain ramps down linearly and reaches its target exactly when the peak leaves
+  // the delay line: the ceiling holds without clipping. Between the two stages the gain recovers exponentially.
+  //
+  // Options:
+  // - gainDb (0): drive into the limiter
+  // - ceilingDb (-1)
+  // - lookaheadSec (0.005), which is also the latency
+  // - releaseSec (0.1)
+  const ilimit = (f, opts = {}) => {
+    const sr = sampleRate
+    const drive = Math.pow(10, (opts.gainDb ?? 0) / 20)
+    const ceiling = Math.pow(10, (opts.ceilingDb ?? -1) / 20)
+    const n = Math.max(1, Math.round((opts.lookaheadSec ?? 0.005) * sr))
+    const releaseCoef = 1 - Math.exp(-1 / ((opts.releaseSec ?? 0.1) * sr))
+
+    const delayed = new Float64Array(n * 2)
+    const boxcar = new Float64Array(n)
+    const wedgeFrames = new Float64Array(n)
+    const wedgeGains = new Float64Array(n)
+    let wedgeHead = 0
+    let wedgeSize = 0
+    let boxcarSum = n
+    let released = 1
+    const out = alloc()
+    let last = -1
+
+    const reset = () => {
+      delayed.fill(0)
+      boxcar.fill(1)
+      boxcarSum = n
+      wedgeSize = 0
+      released = 1
+    }
+    
+    reset()
+
+    const render = (frame) => {
+      const [il, ir] = f(frame / sr)
+      const xl = il * drive
+      const xr = ir * drive
+      const peak = Math.max(Math.abs(xl), Math.abs(xr))
+      const gain = peak > ceiling ? ceiling / peak : 1
+
+      if (wedgeSize > 0 && wedgeFrames[wedgeHead] <= frame - n) {
+        wedgeHead = (wedgeHead + 1) % n
+        wedgeSize--
+      }
+      while (wedgeSize > 0 && wedgeGains[(wedgeHead + wedgeSize - 1) % n] >= gain) wedgeSize--
+      const tail = (wedgeHead + wedgeSize) % n
+      wedgeFrames[tail] = frame
+      wedgeGains[tail] = gain
+      wedgeSize++
+      const held = wedgeGains[wedgeHead]
+
+      released = held < released ? held : released + (held - released) * releaseCoef
+      const k = wrap(frame, n)
+      boxcarSum += released - boxcar[k]
+      boxcar[k] = released
+      // Re-sum once per window so rounding errors cannot accumulate.
+      if (k === 0) boxcarSum = boxcar.reduce((a, b) => a + b, 0)
+      const smoothed = boxcarSum / n
+
+      delayed[k * 2] = xl
+      delayed[k * 2 + 1] = xr
+      const oldest = wrap(frame + 1, n) * 2
+      out[L] = delayed[oldest] * smoothed
+      out[R] = delayed[oldest + 1] * smoothed
+    }
+
+    return (t) => {
+      const frame = Math.round(t * sr)
+      if (frame < last || frame > last + sr) {
+        reset()
+        last = frame - 1
+      }
+      while (last < frame) render(++last)
+      return out
+    }
+  }
+
+  // Impure ping-pong delay.
+  //
+  // A stereo feedback delay: the mono sum of `f` enters the left line, and each line feeds the other, so the
+  // repeats bounce left, right, left, ... A one-pole lowpass at `dampHz` in the loop makes every repeat darker
+  // than the last, like a tape echo.
+  //
+  // Options:
+  // - dampHz (3500)
+  // - mix (0.35): 1 returns only the echoes, which is what a send bus wants
+  const ipingpong = (f, stepSec, feedback = 0.5, opts = {}) => {
+    const sr = sampleRate
+    const n = Math.max(1, Math.round(stepSec * sr))
+    const damp = Math.exp((-TAU * (opts.dampHz ?? 3500)) / sr)
+    const mix = opts.mix ?? 0.35
+    const lineL = new Float64Array(n)
+    const lineR = new Float64Array(n)
+    let dampL = 0
+    let dampR = 0
+    const out = alloc()
+    let last = -1
+
+    const render = (frame) => {
+      const [xl, xr] = f(frame / sr)
+      const k = wrap(frame, n)
+      dampL = lineL[k] + damp * (dampL - lineL[k])
+      dampR = lineR[k] + damp * (dampR - lineR[k])
+      lineL[k] = (xl + xr) * 0.5 + dampR * feedback
+      lineR[k] = dampL * feedback
+      out[L] = xl * (1 - mix) + dampL * mix
+      out[R] = xr * (1 - mix) + dampR * mix
+    }
+
+    return (t) => {
+      const frame = Math.round(t * sr)
+      if (frame < last || frame > last + sr) {
+        lineL.fill(0)
+        lineR.fill(0)
+        dampL = 0
+        dampR = 0
+        last = frame - 1
+      }
+      while (last < frame) render(++last)
       return out
     }
   }
@@ -1614,6 +1779,279 @@ const Æ = (() => {
     return fn
   }
 
+  // Formant singing voice.
+  //
+  // `notes` lists [startSec, durSec, note, syllable] where `syllable` is a space separated list of `speechPhonemes`,
+  // e.g. "T EY K". The vowel lands on `startSec`; consonants before it are sung ahead of time and those after it
+  // close the syllable. A syllable is held until the next one starts, so lines are legato unless the score rests.
+  //
+  // - Pitch glides between notes. The phase is the closed-form integral of the glide, with the phase at every note
+  //   start precomputed as a prefix sum, so the voice is pure and continuous at any `t`.
+  // - Cascade formant synthesis (Fant, "Acoustic Theory of Speech Production", 1960): every harmonic of the glottal
+  //   source, falling 6dB/oct after lip radiation, is weighted by the product of the resonator magnitude responses
+  //   |H(f)| = F^2 / sqrt((F^2 - f^2)^2 + (B f)^2) of the three phoneme formants and two fixed upper ones, so vowel
+  //   spectra follow from formant frequencies and bandwidths alone. All harmonics come from one sin and cos by the
+  //   Chebyshev recurrence sin(kx) = 2 cos(x) sin((k - 1)x) - sin((k - 2)x).
+  // - Phonemes crossfade over `transitionSec`. Plosives close, then burst. Noise is shaped by the formants like the
+  //   parallel branch of Klatt's synthesizer and crossfaded, not swept, between phonemes.
+  //
+  // Options:
+  // - glideSec (0.07)
+  // - transitionSec (0.05)
+  // - consonantSec (0.055)
+  // - vibratoHz (5.4), vibratoDepth (0.012), vibratoDelaySec (0.25): vibrato fades in on held notes
+  // - breath (0.03)
+  // - maxHarmonics (48)
+  // - gain (0.35)
+  // - pan (0)
+  const SING_VOWELS = new Set(["AA", "AE", "AH", "AO", "AW", "EH", "ER", "EY", "IH", "IY", "OW", "OY", "UH", "UW"])
+  // plosives, and whether each is voiced
+  const SING_PLOSIVES = { B: true, D: true, G: true, P: false, T: false, K: false }
+  const SING_NASALS = new Set(["M", "N", "NG"])
+  const SING_UPPER_HZ = [3500, 4500]
+  const SING_UPPER_BW_HZ = [250, 300]
+  const SING_UPPER_POLES = SING_UPPER_HZ[0] * SING_UPPER_HZ[0] * SING_UPPER_HZ[1] * SING_UPPER_HZ[1]
+  const sing = (notes, opts = {}) => {
+    const glideSec = opts.glideSec ?? 0.07
+    const transitionSec = opts.transitionSec ?? 0.05
+    const consonantSec = opts.consonantSec ?? 0.055
+    const vibratoHz = opts.vibratoHz ?? 5.4
+    const vibratoDepth = opts.vibratoDepth ?? 0.012
+    const vibratoDelaySec = opts.vibratoDelaySec ?? 0.25
+    const breath = opts.breath ?? 0.03
+    const maxHarmonics = opts.maxHarmonics ?? 48
+    const gain = opts.gain ?? 0.35
+    const panPos = opts.pan ?? 0
+
+    // Phoneme segments and one pitch event per syllable, both sorted by start.
+    const syllables = [...notes]
+      .sort((a, b) => a[0] - b[0])
+      .map(([startSec, durSec, note, syllable]) => {
+        const phonemes = syllable.trim().toUpperCase().split(/\s+/)
+        const first = Math.max(
+          0,
+          phonemes.findIndex((p) => SING_VOWELS.has(p))
+        )
+        let last = first
+        while (last + 1 < phonemes.length && SING_VOWELS.has(phonemes[last + 1])) last++
+        const onset = phonemes.slice(0, first)
+        return {
+          onset,
+          vowels: phonemes.slice(first, last + 1),
+          coda: phonemes.slice(last + 1),
+          startSec,
+          onsetSec: startSec - onset.length * consonantSec,
+          heldSec: startSec + durSec,
+          hz: pitch(note),
+        }
+      })
+    const segments = []
+    const events = []
+    syllables.forEach((s, i) => {
+      const next = syllables[i + 1]
+      const endSec = Math.max(s.startSec + 0.03, Math.min(s.heldSec, next ? next.onsetSec : Infinity))
+      const add = (startSec, endSec, p) => {
+        const ph = speechPhonemes[p] ?? speechPhonemes.SP
+        const plosive = p in SING_PLOSIVES
+        segments.push({ startSec, endSec, ph, plosive, voiced: SING_PLOSIVES[p] === true, nasal: SING_NASALS.has(p) })
+      }
+      s.onset.forEach((p, k) => add(s.onsetSec + k * consonantSec, s.onsetSec + (k + 1) * consonantSec, p))
+      const vowelEndSec = Math.max(s.startSec + 0.03, endSec - s.coda.length * consonantSec)
+      // a diphthong spends most of its time on the first vowel
+      const splitSec = s.vowels.length > 1 ? s.startSec + (vowelEndSec - s.startSec) * 0.65 : vowelEndSec
+      add(s.startSec, splitSec, s.vowels[0])
+      if (s.vowels.length > 1) add(splitSec, vowelEndSec, s.vowels[1])
+      s.coda.forEach((p, k) => add(vowelEndSec + k * consonantSec, vowelEndSec + (k + 1) * consonantSec, p))
+      events.push({ startSec: s.onsetSec, hz: s.hz })
+    })
+
+    const lastStarted = (items, t) => {
+      let lo = 0
+      let hi = items.length - 1
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1
+        if (items[mid].startSec <= t) lo = mid + 1
+        else hi = mid - 1
+      }
+      return hi
+    }
+
+    // Pitch: linear glides from the previous note, integrated in closed form.
+    const fromHz = events.map((e, i) => (i > 0 ? events[i - 1].hz : e.hz))
+    const cyclesInto = (i, dt) => {
+      const g = Math.min(dt, glideSec)
+      return events[i].hz * dt + (fromHz[i] - events[i].hz) * (g - (g * g) / (2 * glideSec))
+    }
+    const startCycles = new Float64Array(events.length)
+    for (let i = 1; i < events.length; i++) {
+      startCycles[i] = startCycles[i - 1] + cyclesInto(i - 1, events[i].startSec - events[i - 1].startSec)
+    }
+
+    // A contiguous timeline: silence fills the gaps, every item lasts until the next one starts, and every boundary
+    // is a crossfade no wider than half of either neighbor.
+    const silent = speechPhonemes.SP
+    const timeline = [{ startSec: -Infinity, ph: silent }]
+    for (const seg of segments.sort((a, b) => a.startSec - b.startSec)) {
+      const prevEndSec = timeline[timeline.length - 1].endSec ?? -Infinity
+      if (seg.startSec > prevEndSec + 1e-9 && timeline.length > 1) timeline.push({ startSec: prevEndSec, ph: silent })
+      timeline.push(seg)
+    }
+    timeline.push({ startSec: segments.length > 0 ? segments[segments.length - 1].endSec : 0, ph: silent })
+    const edgeHalfSec = timeline.map((item, i) => {
+      if (i === 0) return 0
+      const nextSec = i + 1 < timeline.length ? timeline[i + 1].startSec : Infinity
+      return Math.min(transitionSec / 2, (item.startSec - timeline[i - 1].startSec) / 2, (nextSec - item.startSec) / 2)
+    })
+
+    // Voicing and noise of timeline item `i` at `t`. Plosives are silent while closed, then burst; a vowel after a
+    // voiceless plosive starts aspirated, i.e. as noise through its own formants before the voicing sets in.
+    const level = { voice: 0, noise: 0 }
+    const shape = (i, t) => {
+      const item = timeline[i]
+      level.voice = item.ph.voice
+      level.noise = item.ph.noise
+      if (item.plosive) {
+        const releaseSec = (item.startSec + timeline[i + 1].startSec) / 2
+        if (t < releaseSec) {
+          level.voice = item.voiced ? 0.25 : 0
+          level.noise = 0
+        } else {
+          const dt = t - releaseSec
+          level.noise *= Math.min(1, dt / 0.001) * (1 + 2.5 * Math.exp(-dt / 0.008))
+        }
+      } else if (i > 0 && timeline[i - 1].plosive && !timeline[i - 1].voiced) {
+        const x = Math.min(1, (t - item.startSec) / 0.05)
+        level.voice *= 0.2 + 0.8 * x
+        level.noise += 0.6 * (1 - x)
+      }
+      return level
+    }
+
+    // The two phonemes around `t` and the crossfade between them.
+    const mix = { a: silent, b: silent, alpha: 0, voiceA: 0, voiceB: 0, noiseA: 0, noiseB: 0, nasal: 0 }
+    const blend = (t, i, j, alpha) => {
+      mix.a = timeline[i].ph
+      mix.b = timeline[j].ph
+      mix.alpha = alpha * alpha * (3 - 2 * alpha)
+      mix.nasal = lerp(timeline[i].nasal ? 1 : 0, timeline[j].nasal ? 1 : 0, mix.alpha)
+      const a = shape(i, t)
+      mix.voiceA = a.voice
+      mix.noiseA = a.noise
+      const b = shape(j, t)
+      mix.voiceB = b.voice
+      mix.noiseB = b.noise
+      return mix
+    }
+    const locate = (t) => {
+      const i = lastStarted(timeline, t)
+      const startHalfSec = edgeHalfSec[i]
+      if (i > 0 && t - timeline[i].startSec < startHalfSec) {
+        return blend(t, i - 1, i, 0.5 + (0.5 * (t - timeline[i].startSec)) / startHalfSec)
+      }
+      if (i + 1 < timeline.length) {
+        const untilSec = timeline[i + 1].startSec - t
+        const endHalfSec = edgeHalfSec[i + 1]
+        if (untilSec < endHalfSec) return blend(t, i, i + 1, 0.5 - (0.5 * untilSec) / endHalfSec)
+      }
+      return blend(t, i, i, 0)
+    }
+
+    const formantHz = new Float64Array(3)
+    const bandwidthHz = new Float64Array(3)
+    const out = alloc()
+    const fn = (t) => {
+      const m = locate(t)
+      const voice = lerp(m.voiceA, m.voiceB, m.alpha)
+      const hiss = lerp(m.noiseA, m.noiseB, m.alpha)
+      if (voice < 1e-4 && hiss < 1e-4) {
+        out[L] = 0
+        out[R] = 0
+        return out
+      }
+
+      let s = 0
+      if (voice >= 1e-4) {
+        const i = Math.max(0, lastStarted(events, t))
+        const dt = t - events[i].startSec
+        const hz = events[i].hz + (fromHz[i] - events[i].hz) * Math.max(0, 1 - dt / glideSec)
+        // Vibrato fades in on held notes and out before the next one, so its phase term, the integral of the
+        // frequency deviation, is continuous across notes.
+        const untilNextSec = i + 1 < events.length ? events[i + 1].startSec - t : Infinity
+        const depth =
+          vibratoDepth * Math.min(1, Math.max(0, dt - vibratoDelaySec) / 0.3, Math.max(0, untilNextSec) / 0.08)
+        const cycles = startCycles[i] + cyclesInto(i, dt) - (hz * depth * cos(t, vibratoHz)) / (TAU * vibratoHz)
+        // fading from or into silence only changes the level, not the formants
+        const from = m.a === silent ? m.b : m.a
+        const to = m.b === silent ? m.a : m.b
+        for (let k = 0; k < 3; k++) {
+          formantHz[k] = lerp(from.f[k], to.f[k], m.alpha)
+          bandwidthHz[k] = lerp(from.bw[k], to.bw[k], m.alpha)
+        }
+        const murmur = lerp(from.amp[0], to.amp[0], m.alpha)
+        const phaseRad = TAU * cycles
+        const twoCos = 2 * Math.cos(phaseRad)
+        // the cascade has rolled off by 7kHz; the breath noise carries the air above
+        const harmonics = Math.min(maxHarmonics, Math.floor(Math.min(sampleRate * 0.45, 7000) / hz))
+        let sinK = Math.sin(phaseRad)
+        let sinPrev = 0
+        let sum = 0
+        let power = 0
+        // The product of the five responses shares one sqrt: numerators and denominators are multiplied first,
+        // which stays far inside the double range (about 1e70).
+        const p0 = formantHz[0] * formantHz[0]
+        const p1 = formantHz[1] * formantHz[1]
+        const p2 = formantHz[2] * formantHz[2]
+        const poles = p0 * p1 * p2 * SING_UPPER_POLES
+        for (let k = 1; k <= harmonics; k++) {
+          const f = k * hz
+          const ff = f * f
+          const d0 = p0 - ff
+          const d1 = p1 - ff
+          const d2 = p2 - ff
+          const d3 = SING_UPPER_HZ[0] * SING_UPPER_HZ[0] - ff
+          const d4 = SING_UPPER_HZ[1] * SING_UPPER_HZ[1] - ff
+          const b0 = bandwidthHz[0] * bandwidthHz[0] * ff
+          const b1 = bandwidthHz[1] * bandwidthHz[1] * ff
+          const b2 = bandwidthHz[2] * bandwidthHz[2] * ff
+          const b3 = SING_UPPER_BW_HZ[0] * SING_UPPER_BW_HZ[0] * ff
+          const b4 = SING_UPPER_BW_HZ[1] * SING_UPPER_BW_HZ[1] * ff
+          const den = (d0 * d0 + b0) * (d1 * d1 + b1) * (d2 * d2 + b2) * (d3 * d3 + b3) * (d4 * d4 + b4)
+          let g = poles / (k * Math.sqrt(den))
+          // nasal murmur: the closed mouth leaves little above the low nasal resonance
+          if (m.nasal > 0) {
+            const ratio = ff / 250000 // (f / 500Hz)^2
+            g /= 1 + m.nasal * ratio * ratio
+          }
+          sum += sinK * g
+          power += g * g
+          const sinNext = twoCos * sinK - sinPrev
+          sinPrev = sinK
+          sinK = sinNext
+        }
+        // equal loudness across vowels; consonants keep the quieter murmur of their first formant
+        s += (power > 0 ? sum / Math.sqrt(power) : 0) * voice * murmur * 0.7
+      }
+
+      // vowels carry a trace of noise in the table; the breath layer covers it far more cheaply
+      const noiseA = (1 - m.alpha) * m.noiseA
+      const noiseB = m.alpha * m.noiseB
+      let noisy = 0
+      for (let n = 0; n < 3; n++) {
+        if (noiseA > 0.05) noisy += noiseA * m.a.amp[n] * bandNoise(t, m.a.f[n], m.a.bw[n] * 1.5, n)
+        if (noiseB > 0.05) noisy += noiseB * m.b.amp[n] * bandNoise(t, m.b.f[n], m.b.bw[n] * 1.5, n)
+      }
+      s += noisy * 0.9 + bandNoise(t, 2500, 1800, 0.77) * breath * voice
+
+      const p = Math.max(-1, Math.min(1, E(t, panPos)))
+      const angle = (p + 1) * Math.PI * 0.25
+      out[L] = s * gain * Math.cos(angle) * Math.SQRT2
+      out[R] = s * gain * Math.sin(angle) * Math.SQRT2
+      return out
+    }
+    fn.dur = segments.length > 0 ? segments[segments.length - 1].endSec : 0
+    return fn
+  }
+
   // Impure virtual-analog voice, the subtractive synth of a modern soft synth.
   //
   // - `voices` unison PolyBLEP oscillators detuned across ±`detuneCents`, panned across `spread`, with fixed phase
@@ -1852,6 +2290,36 @@ const Æ = (() => {
     }
   }
 
+  // Synthetic hand clap.
+  //
+  // After the Roland TR-808 clap circuit: bandpassed noise under an envelope that retriggers `bursts` times,
+  // `spreadSec` apart, for the hands that never hit at once, then a longer tail that stands in for the room.
+  // The noise is `bandNoise` around `toneHz` plus a quieter band above it, with independent streams per channel.
+  const clap = (opts = {}) => {
+    const decaySec = opts.decaySec ?? 0.16
+    const toneHz = opts.toneHz ?? 1200
+    const spreadSec = opts.spreadSec ?? 0.009
+    const bursts = opts.bursts ?? 3
+    const burstsSec = bursts * spreadSec
+    const tailStartSec = burstsSec - spreadSec
+    const out = alloc()
+    return (t) => {
+      if (t <= 0) {
+        out[L] = 0
+        out[R] = 0
+        return out
+      }
+      const burst = t < burstsSec ? Math.exp(-(t % spreadSec) / 0.0024) : 0
+      const tail = t < tailStartSec ? 0 : 0.55 * Math.exp(-(t - tailStartSec) / decaySec)
+      const env = Math.max(burst, tail) * 0.45
+      const nl = bandNoise(t, toneHz, toneHz * 0.5, 0.17) + 0.45 * bandNoise(t, toneHz * 2.7, toneHz, 0.41)
+      const nr = bandNoise(t, toneHz, toneHz * 0.5, 0.67) + 0.45 * bandNoise(t, toneHz * 2.7, toneHz, 0.89)
+      out[L] = nl * env
+      out[R] = nr * env
+      return out
+    }
+  }
+
   // Synthetic hihat.
   //
   // Metal: two FM pairs with irrational frequency ratios produce a dense inharmonic spectrum around `shimmerHz`
@@ -1953,6 +2421,7 @@ const Æ = (() => {
     timeReverse,
     timeRepeat,
     ibuf,
+    bake,
 
     // sequencers
     shuffle,
@@ -1968,6 +2437,8 @@ const Æ = (() => {
     iphaser,
     distort,
     icomp,
+    ilimit,
+    ipingpong,
     ivocoder,
     isvf,
     ireverb,
@@ -1980,11 +2451,13 @@ const Æ = (() => {
     ikarplus,
     speechPhonemes,
     formantSpeech,
+    sing,
     fm2,
 
     // drums
     kick,
     snare,
+    clap,
     hihat,
   }
 })()
